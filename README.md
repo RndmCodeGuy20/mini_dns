@@ -101,6 +101,24 @@ idf.py --preview set-target linux -C host_test build
 Exits 0 with `24 Tests 0 Failures` on success — a nonzero exit is Unity's failure
 count, so this is CI-friendly as-is.
 
+## Continuous Integration
+
+Every push and pull request runs two independent GitHub Actions jobs
+(`.github/workflows/ci.yml`): `firmware-build` (ESP32-S3 target, same `idf.py
+build` as above) and `host-tests` (the `host_test/` Unity suite, same commands as
+above). Both jobs run inside the `espressif/idf:release-v5.4` Docker image, so
+they match the ESP-IDF version this README documents.
+
+Pushing a version tag (`git tag v0.6.0 && git push --tags`) additionally
+triggers a `release` job that builds the firmware and attaches
+`bootloader.bin`/`partition-table.bin`/`mini_dns.bin` to a GitHub Release.
+**These release binaries are built with placeholder Wi-Fi/admin credentials and
+will not join any real network** — CI has no access to your real
+`wifi_credentials.h`/`admin_credentials.h` (both gitignored, by design — see
+Setup above). Anyone deploying to a real device still needs to create those two
+files locally and rebuild, exactly as in Setup steps 2–3; the release binaries
+exist as a CI-verified reference build, not a flash-and-go artifact.
+
 ## Known gotchas (see ARCHITECTURE.md for full detail)
 
 - **`.local` hostnames won't resolve from a phone/laptop browser.** `.local` is reserved for mDNS (RFC 6762); client OS resolvers intercept it before it ever reaches this device's DNS server. `dig`/`nslookup` work fine since they bypass that OS-level special-casing. Use a different TLD (e.g. `.loc`, `.test`) for anything you need a real browser to resolve. The device itself is always reachable at `edge-dns.local` via a real mDNS responder (Phase 4) — that's a separate mechanism from your own records.
