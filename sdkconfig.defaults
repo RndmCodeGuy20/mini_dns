@@ -1,6 +1,11 @@
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 
+# Custom partitions.csv: the default single-app table (24K nvs, 1M app) left
+# the app partition at 98% full after Phase 2 — see partitions.csv.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
 # PSRAM: assumes the common ESP32-S3 16MB-flash module pairing, WROOM-1
 # N16R8 (8MB octal PSRAM). If the actual module uses quad PSRAM instead,
 # CONFIG_SPIRAM_IGNORE_NOTFOUND below keeps boot from hard-failing —

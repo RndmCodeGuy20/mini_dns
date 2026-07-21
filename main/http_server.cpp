@@ -6,6 +6,7 @@
 #include <string>
 
 #include "cJSON.h"
+#include "dns_blocklist.h"
 #include "dns_records.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -108,6 +109,51 @@ constexpr httpd_uri_t RECORDS_URI = {
     .user_ctx = nullptr,
 };
 
+esp_err_t blocklist_get_handler(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (root == nullptr) {
+        ESP_LOGE(TAG, "Failed to allocate JSON object");
+        return httpd_resp_send_500(req);
+    }
+
+    const DnsBlocklist &bl = blocklist();
+    cJSON_AddNumberToObject(root, "count", static_cast<double>(bl.size()));
+    cJSON_AddNumberToObject(root, "blocked_total", static_cast<double>(bl.blocks_total()));
+
+    cJSON *domains = cJSON_CreateArray();
+    if (domains == nullptr) {
+        ESP_LOGE(TAG, "Failed to allocate JSON array");
+        cJSON_Delete(root);
+        return httpd_resp_send_500(req);
+    }
+    for (const auto &domain : bl.domains()) {
+        cJSON_AddItemToArray(domains, cJSON_CreateString(domain.c_str()));
+    }
+    cJSON_AddItemToObject(root, "domains", domains);
+
+    char *json_str = cJSON_PrintUnformatted(root);
+    if (json_str == nullptr) {
+        ESP_LOGE(TAG, "Failed to serialize JSON");
+        cJSON_Delete(root);
+        return httpd_resp_send_500(req);
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t ret = httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+
+    cJSON_free(json_str);
+    cJSON_Delete(root);
+    return ret;
+}
+
+constexpr httpd_uri_t BLOCKLIST_URI = {
+    .uri = "/api/blocklist",
+    .method = HTTP_GET,
+    .handler = blocklist_get_handler,
+    .user_ctx = nullptr,
+};
+
 } // namespace
 
 void http_server_start()
@@ -118,6 +164,7 @@ void http_server_start()
     ESP_ERROR_CHECK(httpd_start(&server, &config));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ROOT_URI));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &RECORDS_URI));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &BLOCKLIST_URI));
 
     ESP_LOGI(TAG, "HTTP server listening on port %d", config.server_port);
 }

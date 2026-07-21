@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 
+#include "dns_blocklist.h"
 #include "dns_cache.h"
 #include "dns_forwarder.h"
 #include "dns_records.h"
@@ -116,9 +117,11 @@ void handle_upstream_reply(int listen_sock, DnsForwarder &forwarder, DnsCache &c
                   reply->client.client_addr_len, reply->qname_lower.c_str());
 }
 
-// Handles one query that arrived on the listen socket: local table,
-// then cache, then forwarding — see the design doc for why local
-// records take precedence over anything cached/forwarded.
+// Handles one query that arrived on the listen socket: local table, then
+// blocklist, then cache, then forwarding — see the design doc for why
+// local records take precedence over anything cached/forwarded, and why
+// the blocklist runs before the cache/forwarder (a cached or freshly
+// forwarded answer for a blocked name would otherwise defeat the block).
 void handle_client_query(int listen_sock, DnsForwarder &forwarder, DnsCache &cache)
 {
     std::array<uint8_t, RX_BUFFER_SIZE> rx_buffer;
@@ -195,6 +198,27 @@ void handle_client_query(int listen_sock, DnsForwarder &forwarder, DnsCache &cac
     }
 
     std::string qname_lower = lowercase_ascii(*qname);
+
+    if (blocklist().is_blocked(qname_lower)) {
+        blocklist().record_block();
+        std::optional<size_t> resp_len;
+        if (qtype == DNS_TYPE_A) {
+            constexpr std::array<uint8_t, 4> SINKHOLE_IP = {0, 0, 0, 0};
+            resp_len = build_a_record_response(header->id, header->flags, question_section,
+                                                question_section_len, SINKHOLE_IP, tx_buffer,
+                                                sizeof(tx_buffer));
+        } else {
+            resp_len = build_nxdomain_response(header->id, header->flags, question_section,
+                                                question_section_len, tx_buffer, sizeof(tx_buffer));
+        }
+        if (resp_len) {
+            ESP_LOGI(TAG, "blocked '%s'", qname->c_str());
+            send_response(listen_sock, tx_buffer, *resp_len, source_addr, socklen,
+                          qname->c_str());
+        }
+        return;
+    }
+
     const dns_cache_entry_t *cached = cache.lookup(qname_lower, qtype, now_ms());
     if (cached != nullptr) {
         auto resp_len = build_relayed_response(header->id, header->flags, question_section,
@@ -308,5 +332,14 @@ void dns_server_task(void *)
 
 void dns_server_start()
 {
+    // Loaded synchronously, before the task (and before http_server_start(),
+    // called after this returns — see main.cpp) — so neither the first
+    // query nor the first /api/blocklist request can race an empty list.
+    esp_err_t blocklist_err = blocklist().load_from_nvs();
+    if (blocklist_err != ESP_OK) {
+        ESP_LOGW(TAG, "blocklist failed to load (%s); starting with an empty list",
+                 esp_err_to_name(blocklist_err));
+    }
+
     xTaskCreate(dns_server_task, "dns_server", 6144, nullptr, 5, nullptr);
 }

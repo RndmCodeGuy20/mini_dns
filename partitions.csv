@@ -1,0 +1,10 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap
+#
+# Custom table (16MB flash): default IDF single-app table (24K nvs, 1M app)
+# was sized for small flash chips and left the app partition at 98% full
+# after Phase 2 (ad-block). Sized generously here so Phases 3/4 don't repeat
+# this — see docs/superpowers/specs/2026-07-21-edge-dns-phase2-adblock-design.md.
+nvs,      data, nvs,     0x9000,  0x10000,
+phy_init, data, phy,     ,        0x1000,
+factory,  app,  factory, ,        0x400000,
