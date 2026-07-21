@@ -34,3 +34,18 @@ jobs:
         run: |
           idf.py set-target esp32s3
           idf.py build
+
+  host-tests:
+    name: Host-side unit tests (dns_wire)
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:release-v5.4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build host_test (linux target)
+        run: idf.py --preview set-target linux -C host_test build
+
+      - name: Run host tests
+        run: ./host_test/build/host_test.elf
