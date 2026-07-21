@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  firmware-build:
+    name: Build firmware (ESP32-S3)
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:release-v5.4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write placeholder Wi-Fi credentials
+        run: |
+          cat > main/wifi_credentials.h <<'EOF'
+          #pragma once
+          constexpr const char* WIFI_SSID = "ci-placeholder-ssid";
+          constexpr const char* WIFI_PASSWORD = "ci-placeholder-password";
+          EOF
+
+      - name: Write placeholder admin credentials
+        run: |
+          cat > main/admin_credentials.h <<'EOF'
+          #pragma once
+          constexpr const char* ADMIN_USER = "ci-placeholder-admin";
+          constexpr const char* ADMIN_PASS = "ci-placeholder-password";
+          EOF
+
+      - name: Build firmware
+        run: |
+          idf.py set-target esp32s3
+          idf.py build
