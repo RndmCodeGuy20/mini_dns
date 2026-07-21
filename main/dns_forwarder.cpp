@@ -1,5 +1,6 @@
 #include "dns_forwarder.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 
@@ -190,6 +191,10 @@ std::optional<DnsForwarder::reply_t> DnsForwarder::handle_upstream_readable(int6
     reply.ancount = header->ancount;
     reply.answer_section.assign(rx_buffer + question_section_end, rx_buffer + scan->end_offset);
     reply.ttl_seconds = scan->min_ttl;
+    // Send time is recoverable from the stored deadline and the fixed
+    // per-forwarder timeout rather than needing its own field on the slot.
+    int64_t sent_at_ms = slot.deadline_ms - timeout_ms_;
+    reply.latency_ms = static_cast<uint32_t>(std::max<int64_t>(0, now_ms - sent_at_ms));
 
     slot.occupied = false;
     return reply;
@@ -218,4 +223,15 @@ int64_t DnsForwarder::next_deadline_ms() const
         }
     }
     return soonest;
+}
+
+size_t DnsForwarder::in_flight_count() const
+{
+    size_t count = 0;
+    for (const auto &slot : slots_) {
+        if (slot.occupied) {
+            ++count;
+        }
+    }
+    return count;
 }

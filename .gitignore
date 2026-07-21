@@ -1,6 +1,7 @@
 main/wifi_credentials.h
 
 build/
+managed_components/
 cmake-build-debug/
 cmake-build-debug-esp-idf/
 .idea/

@@ -2,9 +2,9 @@
 
 ## What this is
 
-`mini_dns` is ESP32-S3 firmware moving from proof-of-concept toward a marketable "edge DNS" appliance: a single device that connects to Wi-Fi, serves a small hardcoded set of hostnames authoritatively, forwards everything else to an upstream recursive resolver with TTL caching, and serves an HTTP page + JSON API showing the static record table. It was built incrementally — Wi-Fi → raw UDP → DNS parsing → single-record response → multi-record + NXDOMAIN → HTTP server → JSON API → page wired to the API → **forwarding resolver + cache (Phase 1 of the edge-DNS roadmap)** — each step flashed and confirmed on real hardware before moving on.
+`mini_dns` is ESP32-S3 firmware moving from proof-of-concept toward a marketable "edge DNS" appliance: a single device that connects to Wi-Fi, serves a small hardcoded set of hostnames authoritatively, forwards everything else to an upstream recursive resolver with TTL caching, sinkholes ad/tracker domains, exposes Prometheus metrics, advertises itself via mDNS, and serves an HTTP page + JSON API showing the static record table. It was built incrementally — Wi-Fi → raw UDP → DNS parsing → single-record response → multi-record + NXDOMAIN → HTTP server → JSON API → page wired to the API → **forwarding resolver + cache (Phase 1)** → **NVS-backed ad-block (Phase 2)** → **Prometheus `/metrics` (Phase 3)** → **mDNS responder (Phase 4)** — each step flashed and confirmed on real hardware before moving on.
 
-**Records are still compile-time constants, read-only after boot** — there is no persistence, no provisioning UI, no OTA, no runtime record editing, no auth. Ad-block, metrics/OTEL export, and mDNS are planned as later phases (see Future scoping), not built yet. If you're extending this, read the Non-Goals section before adding anything that smells like a "real" feature.
+**Records are still compile-time constants, read-only after boot** — there is no persistence, no provisioning UI, no OTA, no runtime record editing, no auth. If you're extending this, read the Non-Goals section before adding anything that smells like a "real" feature.
 
 ## Target hardware / toolchain
 
@@ -25,31 +25,38 @@ sequenceDiagram
     wifi_connect-->>app_main: returns once IP obtained
     app_main->>dns_task: dns_server_start() [xTaskCreate, returns immediately]
     app_main->>httpd: http_server_start() [httpd_start, returns immediately]
+    app_main->>mdns: mdns_responder_start() [mdns_init, returns immediately]
     app_main--)app_main: app_main() returns, its task exits
-    Note over dns_task,httpd: Both keep running independently.<br/>No shared mutable state between them.
+    Note over dns_task,httpd: All three keep running independently.<br/>No shared mutable state between them.
 ```
 
-Three independent runtime pieces exist after boot, with **no synchronization between them**:
+Four independent runtime pieces exist after boot, with **no synchronization between them**:
 
-1. **Wi-Fi event handling** (`wifi_connect.cpp`) — registered event handlers keep running for the life of the device (auto-reconnect on disconnect), but `wifi_connect()` itself only blocks `app_main` during initial bring-up.
+1. **Wi-Fi event handling** (`wifi_connect.cpp`) — registered event handlers keep running for the life of the device (auto-reconnect on disconnect, plus IPv6 link-local bring-up as of Phase 4), but `wifi_connect()` itself only blocks `app_main` during initial IPv4 bring-up.
 2. **DNS task** (`dns_server.cpp`) — a task we create explicitly via `xTaskCreate`, because raw BSD sockets have no framework driving an accept/receive loop for us.
 3. **HTTP server task(s)** (`http_server.cpp`) — `esp_http_server` owns and drives its own task(s) internally; we only configure and start it.
+4. **mDNS responder task** (`mdns_responder.cpp`, Phase 4) — the `mdns` component owns and drives its own internal task, the same shape as `esp_http_server`; we only configure and start it. It reads whatever A/AAAA addresses the STA netif currently holds and shares no mutable state with the other three pieces.
 
 `DNS_RECORDS` is still `constexpr`, shared read-only across tasks with no locking needed. **As of the forwarding resolver (Phase 1), the DNS task also owns a cache and an in-flight query table** (`DnsCache`, `DnsForwarder`) — these *are* mutable, but they're only ever touched from within the single DNS task's `select()` loop, so the "no shared mutable state across tasks" property still holds; it's just no longer literally "no mutable state," only "no mutable state shared *between* tasks."
+
+Two pieces of state *do* deliberately cross the DNS task / HTTP task boundary, and both do it without a mutex: `DnsBlocklist`'s domain set (Phase 2) is populated once at boot and never mutated again, so concurrent reads need no synchronization; and `DnsMetrics` (Phase 3) is a set of `std::atomic<uint32_t>` counters/gauges — the DNS task increments/sets them inline, the HTTP task's `/metrics` handler reads a `snapshot()`. Both are narrow, deliberate exceptions to "no shared mutable state," justified the same way: either the shared value is immutable after boot, or it's a single atomic word.
 
 ## Component map
 
 | File | Responsibility |
 |---|---|
-| `main/main.cpp` | Boot sequence: logs detected PSRAM size → `wifi_connect()` → `dns_server_start()` → `http_server_start()`. |
-| `main/wifi_connect.h/.cpp` | Blocking Wi-Fi station bring-up with hardcoded credentials. Retries forever on disconnect (2s backoff), no give-up state. |
+| `main/main.cpp` | Boot sequence: logs detected PSRAM size → `wifi_connect()` → `dns_server_start()` → `http_server_start()` → `mdns_responder_start()`. |
+| `main/wifi_connect.h/.cpp` | Blocking Wi-Fi station bring-up with hardcoded credentials. Retries forever on disconnect (2s backoff), no give-up state. As of Phase 4, also triggers IPv6 link-local address creation on `WIFI_EVENT_STA_CONNECTED` (non-blocking, doesn't gate boot readiness) so mDNS has an address to advertise as AAAA. |
 | `main/wifi_credentials.h` | `WIFI_SSID`/`WIFI_PASSWORD` constants. **Gitignored** — does not exist on a fresh checkout, must be recreated. |
 | `main/dns_records.h` | The hardcoded hostname→IPv4 table (`DNS_RECORDS`, a `constexpr std::array<dns_record_t, N>`). Pure data, no logic, no dependencies beyond `<array>`/`<cstdint>` — intentionally kept dependency-free. |
 | `main/dns_wire.h/.cpp` | Pure DNS wire-format functions: header/question parsing, name skipping, answer-section TTL scanning, and response building (A-record, NXDOMAIN, and a generic "relay a captured answer section" builder used by both cache hits and forwarded replies). No I/O, no FreeRTOS/lwIP dependency — the natural home for host-side unit tests. |
 | `main/dns_cache.h/.cpp` | TTL cache (`DnsCache`) keyed by (lowercased qname, qtype), storing captured answer-section bytes + a clamped TTL. Single-owner (the DNS task); no mutex. |
 | `main/dns_forwarder.h/.cpp` | Upstream UDP client socket (`DnsForwarder`) plus the in-flight query table that correlates upstream replies back to the client that asked, using a slot-index + generation-counter transaction ID scheme. Single-owner; no mutex. |
-| `main/dns_server.h/.cpp` | UDP/53 listener in its own FreeRTOS task, running a `select()` loop over the listen socket and the forwarder's upstream socket. Resolves each query via local table → cache → forward, in that order, and reaps timed-out forwarded queries into SERVFAIL. |
-| `main/http_server.h/.cpp` | `esp_http_server` bring-up with two routes: `GET /` (static HTML page with an inline `fetch()` script) and `GET /api/records` (JSON array via cJSON). Unchanged by Phase 1 — still only reflects the static table, not cache/forwarding activity. |
+| `main/dns_server.h/.cpp` | UDP/53 listener in its own FreeRTOS task, running a `select()` loop over the listen socket and the forwarder's upstream socket. Resolves each query via local table → blocklist → cache → forward, in that order, and reaps timed-out forwarded queries into SERVFAIL. Also the sole writer of `DnsMetrics` (Phase 3). |
+| `main/dns_blocklist.h/.cpp` | NVS-backed ad-block domain set (`DnsBlocklist`), suffix-matched on label boundaries. Populated once at boot, never mutated afterward — safely read from both the DNS and HTTP tasks with no lock; only its atomic block counter changes at runtime. |
+| `main/dns_metrics.h/.cpp` | Runtime counters/gauges/histogram for `/metrics` (`DnsMetrics`, Phase 3) — query/cache/forward/SERVFAIL counts, an upstream-latency histogram, and cache/in-flight occupancy gauges. Written only by the DNS task, read only by the HTTP task's `/metrics` handler, all via `std::atomic<uint32_t>` — the same cross-task shape as `DnsBlocklist`'s counter, generalized into its own module. |
+| `main/http_server.h/.cpp` | `esp_http_server` bring-up with four routes: `GET /` (static HTML page with an inline `fetch()` script), `GET /api/records` (JSON array via cJSON), `GET /api/blocklist` (Phase 2), and `GET /metrics` (Prometheus plaintext, Phase 3). |
+| `main/mdns_responder.h/.cpp` | mDNS responder bring-up (Phase 4, `espressif/mdns` managed component) — advertises the device as `edge-dns.local` (A + AAAA) plus an `_http._tcp` service pointing at the dashboard. Owns its own internal task, no shared mutable state with the DNS/HTTP tasks. |
 
 ## Data flow
 
@@ -89,6 +96,10 @@ Local-table responses still echo the request's question section verbatim and reu
 **HTTP request** (`http_server.cpp`):
 - `GET /` → static HTML shell with an inline `<script>` that does `fetch('/api/records')` and renders the result as a table (`textContent`, not `innerHTML`).
 - `GET /api/records` → builds a `cJSON` array from `DNS_RECORDS`, serializes with `cJSON_PrintUnformatted`, sends as `application/json`.
+- `GET /api/blocklist` → cJSON object with the blocklist's size, running block count, and domain list (Phase 2).
+- `GET /metrics` (Phase 3) → `metrics().snapshot()` plus `blocklist().blocks_total()`/`size()`, rendered as Prometheus plaintext (`text/plain; version=0.0.4`): counters, an upstream-latency histogram, and cache/in-flight gauges. See the Phase 3 design doc for the full series list and why a histogram was chosen over a bare sum+count.
+
+**mDNS discovery** (`mdns_responder.cpp`, Phase 4) — a parallel path to the HTTP request flow above, not part of it: a LAN client sends a multicast query for `edge-dns.local` or browses `_http._tcp`; the `mdns` component's internal task answers directly (A/AAAA for the hostname, PTR/SRV/TXT for the service), independent of both the DNS task's unicast UDP/53 listener and the HTTP task. Resolving the name is a separate step from then fetching it — `curl http://edge-dns.local/` still ends up going through the ordinary HTTP request flow once resolved.
 
 ## Design decisions & gotchas worth remembering
 
@@ -100,12 +111,13 @@ These are the things most likely to confuse future-you or bite an extension:
 - **PSRAM mode is a module-specific assumption** — `sdkconfig.defaults` assumes octal PSRAM (the common WROOM-1 N16R8 pairing with this build's 16MB flash). `CONFIG_SPIRAM_IGNORE_NOTFOUND` keeps boot from hard-failing if that's wrong, and `main.cpp` logs detected PSRAM size at boot so a mismatch is visible immediately rather than showing up later as an unexplained cache-capacity shortfall.
 - **Cache and in-flight table are mutable state, but still single-owner** — both live entirely inside the DNS task's `select()` loop (`dns_server.cpp`), so the codebase's original "no mutex needed" property is preserved; it's just no longer true that *nothing* is mutable, only that nothing mutable crosses a task boundary.
 - **`CONFIG_LWIP_MAX_SOCKETS` is a shared budget across the whole IP stack, and `esp_http_server` checks against it at `httpd_start()`** — its default `max_open_sockets` (7) plus 3 reserved internally is an *exact* fit against ESP-IDF's own default (10), leaving zero headroom. Phase 1 added two sockets outside httpd (DNS listen, forwarder upstream) without raising this, which first shipped as `CONFIG_LWIP_MAX_SOCKETS=8` — actually *lower* than the default — causing `httpd_start()` to abort with `ESP_ERR_INVALID_ARG` on every boot (a crash-reboot loop, not a Wi-Fi problem, even though it happens right after "connected, IP: ..." in the log). Any future socket added outside httpd needs this budget re-checked, not just incremented by one.
-- **`.local` hostnames and mDNS** — `DNS_RECORDS` uses `.local` names (matching the original brief's example), but RFC 6762 reserves `.local` for multicast DNS. Client OS resolvers (especially Apple's) intercept `.local` queries and route them to mDNS instead of whatever unicast DNS server is configured — meaning a phone/laptop browser will **never** actually ask this device about a `.local` name, even with its DNS correctly pointed here. Only tools that bypass the OS's special-casing (`dig`, `nslookup`) or genuinely unreserved TLDs (`.loc`, `.test` — see the `laptop.loc` entry) work reliably end-to-end from a browser. If extending the record table for real device access, prefer a non-`.local` TLD.
+- **`.local` and mDNS — two different things now.** `DNS_RECORDS` was moved off `.local` onto `.loc` (see the `laptop.loc` entry) specifically because RFC 6762 reserves `.local` for multicast DNS: client OS resolvers (especially Apple's) intercept `.local` queries and route them to mDNS instead of whatever unicast DNS server is configured, so a phone/laptop browser would **never** actually ask this device about a `.local` name even with its DNS correctly pointed here. Phase 4 then added a *real* mDNS responder — but only for the device's own name (`edge-dns.local`), not for `DNS_RECORDS`. So: `test.loc`/`router.loc`/etc. are answered by the unicast resolver only (still needs DNS correctly pointed here, or `dig`/`nslookup` to bypass OS special-casing); `edge-dns.local` is answered by mDNS only (any client on the LAN, no DNS configuration needed). Delegating `DNS_RECORDS` as mDNS-resolvable `.local` hosts too was considered and deferred — see the Phase 4 design doc's Open threads.
 - **Startup calls use `ESP_ERROR_CHECK`; per-packet/per-request calls use errno + log + continue.** `esp_wifi_*`, `httpd_start`, `httpd_register_uri_handler` are one-shot, `esp_err_t`-returning, startup-time calls — if they fail, there's no meaningful degraded mode, so they panic immediately with a clear file/line. `socket()`/`bind()`/`recvfrom()`/`sendto()` are raw BSD calls returning `-1`/`errno`, called continuously in a loop — a single bad packet or transient send failure is logged and the loop continues, since aborting the whole device over one dropped packet would be wrong. Keep this split when adding new calls rather than picking one style for the whole codebase.
 - **Case-insensitive hostname matching** (`ascii_case_insensitive_equal` in `dns_server.cpp`) — DNS names are case-insensitive per RFC 1035 §2.3.3; this was added deliberately at the multi-record step rather than deferred again.
 - **NXDOMAIN, not NODATA, for a wrong-qtype match** — querying `AAAA` for `test.local` (which only has an A record) returns NXDOMAIN, not the RFC-correct NODATA (NOERROR + empty answers). A deliberate simplification: implementing real NODATA would require tracking "name exists at all" as a concept separate from "has an A record," for a distinction nothing in this project depends on.
 - **`dns_records.h` stays pure data on purpose** — no lookup function lives there. The lookup (`find_dns_record`) lives in `dns_server.cpp` next to the rest of the DNS logic, so the records header never needs to pull in `<string>`/`<optional>` or make a case-sensitivity decision itself.
 - **`wifi_credentials.h` is gitignored** — contains real Wi-Fi credentials as `constexpr const char*` values. Does not exist on a fresh clone; must be recreated by hand (see `main/CMakeLists.txt` for the exact symbols it must define: `WIFI_SSID`, `WIFI_PASSWORD`).
+- **Metrics counters are `uint32_t`, not `uint64_t`, on purpose** (Phase 3) — the Xtensa LX7 has no native 64-bit atomic instructions, so `std::atomic<uint64_t>` here would silently fall back to libatomic's lock-based implementation, reintroducing a lock into an otherwise deliberately lock-free cross-task read path. A 32-bit counter wrapping after ~4B events is fine for a LAN-scale device scraped by Prometheus, which already tolerates counter resets via `rate()`.
 - **No automated tests.** All verification so far has been manual and hardware-in-the-loop (flash, `dig`/`curl`/browser, read serial log). This is fine for a POC built step-by-step with a human in the loop, but it's a real gap if this code grows — the wire-format parse/build functions in `dns_server.cpp` (`parse_dns_header`, `parse_question_name`, `build_a_record_response`, `build_nxdomain_response`) are pure functions over byte buffers and are the most natural candidates for host-side unit tests (ESP-IDF bundles the Unity test framework) if that's ever worth adding.
 
 ## Explicit non-goals (as scoped)
@@ -118,17 +130,18 @@ These were ruled out deliberately, not overlooked — don't reintroduce them wit
 - Runtime add/edit/delete of DNS records
 - True iterative/recursive DNS resolution (root-server walking) — forwarding + caching was built instead (Phase 1); see the design doc for the rationale
 - Authentication or access control
-- Ad-block, mDNS responder, metrics/OTEL export — planned as later phases (see Future scoping), not built yet
+- OTLP push export — rejected in favor of the pull-model `/metrics` endpoint (Phase 3); see Future scoping
+- mDNS delegation of `DNS_RECORDS` as `.local` hosts — the responder built in Phase 4 advertises the device itself only, not the static record table; see the Phase 4 design doc's Open threads
 - Heavy C++ (coroutines, modules, template metaprogramming)
 
 ## Future scoping
 
-Roughly ordered by how naturally each extends the current design, not by priority. The overall vision is a marketable "edge DNS" appliance with configurable ad-block, metrics, and mDNS; forwarding + caching (previously listed here as item 2) shipped as **Phase 1** — see `docs/superpowers/specs/2026-07-21-edge-dns-phase1-design.md`.
+Roughly ordered by how naturally each extends the current design, not by priority. The overall vision is a marketable "edge DNS" appliance with configurable ad-block, metrics, and mDNS; forwarding + caching, ad-block, metrics, and mDNS (previously listed here as items 2–4) shipped as **Phases 1–4** — see `docs/superpowers/specs/`.
 
 1. ~~**Upstream DNS forwarding for unmatched queries.**~~ **Done (Phase 1).** See the Data flow and Gotchas sections above and the design doc.
-2. **Ad-block (Phase 2).** A small curated exact-match blocklist (baked-in or NVS-backed), consulted before the cache/forwarder in the resolution order, returning NXDOMAIN or `0.0.0.0` for blocked names. Hooks directly into the resolver built in Phase 1.
-3. **Metrics endpoint (Phase 3).** `GET /metrics` in Prometheus plaintext format on the existing `esp_http_server` — query count, cache hit/miss, blocks, upstream latency, in-flight table depth. Pull model chosen over an OTLP push client for lighter device footprint.
-4. **mDNS responder for real `.local` support (Phase 4).** The `.local` gotcha (see above) is best solved by actually implementing multicast DNS advertisement (e.g. via ESP-IDF's `mdns` component) rather than fighting client OS behavior — a genuinely different mechanism from the unicast resolver, running alongside it rather than replacing it.
+2. ~~**Ad-block.**~~ **Done (Phase 2).** NVS-backed blocklist, suffix-matched on label boundaries, consulted before the cache/forwarder. See `docs/superpowers/specs/2026-07-21-edge-dns-phase2-adblock-design.md`.
+3. ~~**Metrics endpoint.**~~ **Done (Phase 3).** `GET /metrics` in Prometheus plaintext format — query/cache/forward/SERVFAIL counters, an upstream-latency histogram, ad-block total, cache/in-flight gauges. Pull model chosen over an OTLP push client for lighter device footprint. See `docs/superpowers/specs/2026-07-21-edge-dns-phase3-metrics-design.md`.
+4. ~~**mDNS responder.**~~ **Done (Phase 4).** Device self-advertisement as `edge-dns.local` (A + AAAA) plus an `_http._tcp` service via ESP-IDF's `mdns` managed component — a genuinely different mechanism from the unicast resolver, running alongside it rather than replacing it. Does not delegate `DNS_RECORDS` as `.local` hosts (see the `.local` gotcha above and the design doc's Open threads). See `docs/superpowers/specs/2026-07-21-edge-dns-phase4-mdns-design.md`.
 5. **NVS-backed persistence + a real add/edit/delete API.** Would need input validation (hostname syntax, IP parsing), a storage schema, and probably auth (see below) before it's safe to expose over HTTP. This is the single biggest architectural jump from the current design — `DNS_RECORDS` stops being `constexpr`, and `find_dns_record` needs a mutex or similar since it'd now cross the DNS task / HTTP task boundary as shared mutable state.
 6. **`POST`/`PUT`/`DELETE` on `/api/records`**, paired with #5 — natural home for it given the JSON API already exists for reads.
 7. **Basic auth** on any endpoint that becomes mutating (#5/#6) — not needed while everything is read-only, becomes necessary the moment editing exists.

@@ -11,6 +11,7 @@
 #include "dns_blocklist.h"
 #include "dns_cache.h"
 #include "dns_forwarder.h"
+#include "dns_metrics.h"
 #include "dns_records.h"
 #include "dns_wire.h"
 #include "esp_log.h"
@@ -98,6 +99,9 @@ void handle_upstream_reply(int listen_sock, DnsForwarder &forwarder, DnsCache &c
         return; // already logged by the forwarder
     }
 
+    metrics().inc_upstream_replies();
+    metrics().observe_upstream_latency(reply->latency_ms);
+
     uint32_t cache_ttl = reply->ancount > 0 ? reply->ttl_seconds : DNS_NEGATIVE_CACHE_TTL_SECONDS;
     cache.insert(reply->qname_lower, reply->qtype, reply->rcode, reply->ancount,
                  reply->answer_section, cache_ttl, now_ms());
@@ -172,11 +176,13 @@ void handle_client_query(int listen_sock, DnsForwarder &forwarder, DnsCache &cac
     ESP_LOGI(TAG, "query for '%s' type=%s(%u) id=%u", qname->empty() ? "." : qname->c_str(),
              qtype_to_string(qtype), static_cast<unsigned>(qtype),
              static_cast<unsigned>(header->id));
+    metrics().inc_queries();
 
     const dns_record_t *record = find_dns_record(*qname);
     uint8_t tx_buffer[TX_BUFFER_SIZE];
 
     if (record != nullptr) {
+        metrics().inc_local_hits();
         // Local table is authoritative for this name regardless of
         // qtype — never shadowed by cache/upstream, preserving both the
         // "local always wins" property and the existing NXDOMAIN-for-
@@ -221,6 +227,7 @@ void handle_client_query(int listen_sock, DnsForwarder &forwarder, DnsCache &cac
 
     const dns_cache_entry_t *cached = cache.lookup(qname_lower, qtype, now_ms());
     if (cached != nullptr) {
+        metrics().inc_cache_hits();
         auto resp_len = build_relayed_response(header->id, header->flags, question_section,
                                                 question_section_len, cached->rcode,
                                                 cached->ancount, cached->answer_section.data(),
@@ -233,11 +240,15 @@ void handle_client_query(int listen_sock, DnsForwarder &forwarder, DnsCache &cac
         }
         return;
     }
+    metrics().inc_cache_misses();
 
     bool forwarded = forwarder.forward(qname_lower, qtype, header->id, header->flags,
                                         question_section, question_section_len, source_addr,
                                         socklen, now_ms());
-    if (!forwarded) {
+    if (forwarded) {
+        metrics().inc_forwarded();
+    } else {
+        metrics().inc_servfail();
         send_servfail(listen_sock,
                       {header->id, header->flags,
                        std::vector<uint8_t>(question_section,
@@ -304,6 +315,8 @@ void dns_server_task(void *)
         if (forwarding_enabled) {
             for (const auto &expired : forwarder.reap_expired(now_ms())) {
                 ESP_LOGW(TAG, "upstream query timed out, sending SERVFAIL");
+                metrics().inc_upstream_timeouts();
+                metrics().inc_servfail();
                 send_servfail(listen_sock, expired);
             }
         }
@@ -324,6 +337,14 @@ void dns_server_task(void *)
         }
         if (FD_ISSET(listen_sock, &read_fds)) {
             handle_client_query(listen_sock, forwarder, cache);
+        }
+
+        // Republished every iteration rather than incrementally, since
+        // cache/forwarder occupancy already lives in their own owning
+        // classes — see DnsMetrics::set_cache_entries()/set_inflight().
+        metrics().set_cache_entries(static_cast<uint32_t>(cache.size()));
+        if (forwarding_enabled) {
+            metrics().set_inflight(static_cast<uint32_t>(forwarder.in_flight_count()));
         }
     }
 }

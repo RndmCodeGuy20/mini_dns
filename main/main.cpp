@@ -2,6 +2,7 @@
 #include "esp_log.h"
 #include "esp_psram.h"
 #include "http_server.h"
+#include "mdns_responder.h"
 #include "wifi_connect.h"
 
 namespace {
@@ -27,4 +28,5 @@ extern "C" void app_main(void)
     wifi_connect();
     dns_server_start();
     http_server_start();
+    mdns_responder_start();
 }

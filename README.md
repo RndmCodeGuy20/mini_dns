@@ -1,8 +1,8 @@
 # mini_dns
 
-A minimal ESP32-S3 firmware that connects to Wi-Fi, resolves a small hardcoded set of hostnames over DNS (UDP/53), and serves an HTTP page + JSON API showing that same record table.
+A minimal ESP32-S3 firmware that connects to Wi-Fi, resolves a small hardcoded set of hostnames over DNS (UDP/53), forwards everything else to an upstream resolver with TTL caching, sinkholes ad/tracker domains, and serves an HTTP page + JSON API + Prometheus metrics.
 
-Proof-of-concept — no persistence, no provisioning UI, no OTA, no runtime record editing, no auth, no upstream DNS forwarding. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for design details, gotchas, and future scoping.
+Proof-of-concept moving toward a marketable "edge DNS" appliance — no persistence for records, no provisioning UI, no OTA, no runtime record editing, no auth. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for design details, gotchas, and future scoping.
 
 ## Prerequisites
 
@@ -54,12 +54,16 @@ On boot you should see log lines for Wi-Fi connecting (with the assigned IP), th
 Replace `<esp32-ip>` with the IP logged on boot:
 
 ```
-dig @<esp32-ip> <your-hostname>       # DNS resolution
+dig @<esp32-ip> <your-hostname>       # DNS resolution — local table, cache, or forwarded upstream
+dig @<esp32-ip> doubleclick.net       # sinkholed (0.0.0.0 / NXDOMAIN) if on the ad-block list
 curl http://<esp32-ip>/               # HTML dashboard
 curl http://<esp32-ip>/api/records    # JSON record list
+curl http://<esp32-ip>/api/blocklist  # JSON blocklist status + running block count
+curl http://<esp32-ip>/metrics        # Prometheus plaintext metrics
 ```
 
 ## Known gotchas (see ARCHITECTURE.md for full detail)
 
 - **`.local` hostnames won't resolve from a phone/laptop browser.** `.local` is reserved for mDNS (RFC 6762); client OS resolvers intercept it before it ever reaches this device's DNS server. `dig`/`nslookup` work fine since they bypass that OS-level special-casing. Use a different TLD (e.g. `.loc`, `.test`) for anything you need a real browser to resolve.
-- **No upstream DNS forwarding.** This is a leaf resolver — anything not in `DNS_RECORDS` gets NXDOMAIN. If you point a device's DNS settings at this appliance, that device loses normal internet DNS resolution until you point it back.
+- **Forwarding, not true recursion.** Anything not in `DNS_RECORDS` or the ad-block list is forwarded to a single upstream resolver (`1.1.1.1` by default) and cached — not resolved by walking the root servers. No failover: if the upstream is unreachable, non-local queries time out to SERVFAIL after ~2s rather than falling back to a secondary.
+- **Metrics run for the life of the device.** `/metrics` counters reset only on reboot — there's no zero/reset endpoint.

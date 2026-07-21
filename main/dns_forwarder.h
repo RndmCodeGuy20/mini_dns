@@ -75,6 +75,7 @@ public:
         uint16_t ancount;
         std::vector<uint8_t> answer_section; // RR bytes only; see scan_answer_section
         uint32_t ttl_seconds;                // meaningful only when ancount > 0
+        uint32_t latency_ms;                 // now_ms - send time, for /metrics histogram
     };
 
     // Call when socket_fd() is readable: reads one upstream reply,
@@ -95,6 +96,11 @@ public:
     // flight — lets the caller size select()'s timeout so an expiring
     // slot is reaped promptly rather than waiting on unrelated I/O.
     int64_t next_deadline_ms() const;
+
+    // Count of occupied in-flight slots, for the /metrics gauge — a cheap
+    // linear scan over DNS_FORWARDER_MAX_IN_FLIGHT (32) slots, called once
+    // per select() loop iteration (see dns_server.cpp).
+    size_t in_flight_count() const;
 
 private:
     struct in_flight_slot_t {

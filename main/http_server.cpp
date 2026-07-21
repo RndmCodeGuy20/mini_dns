@@ -7,6 +7,9 @@
 
 #include "cJSON.h"
 #include "dns_blocklist.h"
+#include "dns_cache.h"
+#include "dns_forwarder.h"
+#include "dns_metrics.h"
 #include "dns_records.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -154,6 +157,111 @@ constexpr httpd_uri_t BLOCKLIST_URI = {
     .user_ctx = nullptr,
 };
 
+// Appends one counter/gauge family: HELP + TYPE header lines, then a
+// single sample line. Prometheus text exposition format (version 0.0.4).
+void append_simple_metric(std::string &out, const char *name, const char *type,
+                           const char *help, double value)
+{
+    out += "# HELP ";
+    out += name;
+    out += ' ';
+    out += help;
+    out += "\n# TYPE ";
+    out += name;
+    out += ' ';
+    out += type;
+    out += '\n';
+    out += name;
+    out += ' ';
+    char value_buf[32];
+    std::snprintf(value_buf, sizeof(value_buf), "%.17g", value);
+    out += value_buf;
+    out += '\n';
+}
+
+// Appends the upstream latency histogram: cumulative bucket counts (as
+// Prometheus histograms require — each bucket includes everything at or
+// below its own "le" bound, up to +Inf), plus _sum and _count.
+void append_latency_histogram(std::string &out, const DnsMetricsSnapshot &snap)
+{
+    constexpr const char *NAME = "dns_upstream_latency_ms";
+    out += "# HELP ";
+    out += NAME;
+    out += " Upstream resolver round-trip time in milliseconds\n# TYPE ";
+    out += NAME;
+    out += " histogram\n";
+
+    uint32_t cumulative = 0;
+    char line[96];
+    for (size_t i = 0; i < DNS_METRICS_LATENCY_BUCKETS_MS.size(); ++i) {
+        cumulative += snap.latency_buckets[i];
+        std::snprintf(line, sizeof(line), "%s_bucket{le=\"%u\"} %u\n", NAME,
+                      static_cast<unsigned>(DNS_METRICS_LATENCY_BUCKETS_MS[i]),
+                      static_cast<unsigned>(cumulative));
+        out += line;
+    }
+    cumulative += snap.latency_buckets[DNS_METRICS_LATENCY_BUCKETS_MS.size()];
+    std::snprintf(line, sizeof(line), "%s_bucket{le=\"+Inf\"} %u\n", NAME,
+                  static_cast<unsigned>(cumulative));
+    out += line;
+    std::snprintf(line, sizeof(line), "%s_sum %llu\n", NAME,
+                  static_cast<unsigned long long>(snap.latency_sum_ms));
+    out += line;
+    std::snprintf(line, sizeof(line), "%s_count %u\n", NAME,
+                  static_cast<unsigned>(snap.latency_count));
+    out += line;
+}
+
+esp_err_t metrics_get_handler(httpd_req_t *req)
+{
+    DnsMetricsSnapshot snap = metrics().snapshot();
+    const DnsBlocklist &bl = blocklist();
+
+    std::string out;
+    out.reserve(2048);
+
+    append_simple_metric(out, "dns_queries_total", "counter",
+                          "Total DNS queries received", snap.queries);
+    append_simple_metric(out, "dns_local_hits_total", "counter",
+                          "Queries answered from the local static table", snap.local_hits);
+    append_simple_metric(out, "dns_cache_hits_total", "counter",
+                          "Queries answered from the TTL cache", snap.cache_hits);
+    append_simple_metric(out, "dns_cache_misses_total", "counter",
+                          "Queries not found in the TTL cache", snap.cache_misses);
+    append_simple_metric(out, "dns_forwarded_total", "counter",
+                          "Queries forwarded to the upstream resolver", snap.forwarded);
+    append_simple_metric(out, "dns_upstream_replies_total", "counter",
+                          "Replies received from the upstream resolver", snap.upstream_replies);
+    append_simple_metric(out, "dns_upstream_timeouts_total", "counter",
+                          "In-flight queries that timed out waiting on upstream",
+                          snap.upstream_timeouts);
+    append_simple_metric(out, "dns_servfail_total", "counter",
+                          "SERVFAIL responses sent to clients", snap.servfail);
+    append_simple_metric(out, "dns_blocked_total", "counter",
+                          "Queries sinkholed by the ad-block list", bl.blocks_total());
+    append_latency_histogram(out, snap);
+    append_simple_metric(out, "dns_cache_entries", "gauge",
+                          "Current occupied TTL cache slots", snap.cache_entries);
+    append_simple_metric(out, "dns_cache_capacity", "gauge", "TTL cache capacity",
+                          DNS_CACHE_CAPACITY);
+    append_simple_metric(out, "dns_inflight_queries", "gauge",
+                          "Current in-flight upstream queries", snap.inflight);
+    append_simple_metric(out, "dns_inflight_capacity", "gauge", "In-flight query table capacity",
+                          DNS_FORWARDER_MAX_IN_FLIGHT);
+    append_simple_metric(out, "dns_blocklist_domains", "gauge",
+                          "Domains currently loaded in the ad-block list", bl.size());
+
+    httpd_resp_set_type(req, "text/plain; version=0.0.4");
+    return httpd_resp_send(req, out.c_str(), static_cast<ssize_t>(out.size()));
+}
+
+constexpr httpd_uri_t METRICS_URI = {
+    .uri = "/metrics",
+    .method = HTTP_GET,
+    .handler = metrics_get_handler,
+    .user_ctx = nullptr,
+};
+
 } // namespace
 
 void http_server_start()
@@ -165,6 +273,7 @@ void http_server_start()
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ROOT_URI));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &RECORDS_URI));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &BLOCKLIST_URI));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &METRICS_URI));
 
     ESP_LOGI(TAG, "HTTP server listening on port %d", config.server_port);
 }
