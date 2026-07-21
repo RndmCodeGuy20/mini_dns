@@ -10,7 +10,7 @@ struct dns_record_t {
     std::array<uint8_t, 4> ip;
 };
 
-constexpr std::array<dns_record_t, 5> DNS_RECORDS = {{
+constexpr std::array<dns_record_t, 4> DNS_RECORDS = {{
     {"test.loc", {192, 168, 1, 50}},
     {"router.loc", {192, 168, 1, 1}},
     {"nas.loc", {192, 168, 1, 60}},

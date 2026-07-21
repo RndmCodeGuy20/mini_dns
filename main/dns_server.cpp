@@ -1,5 +1,6 @@
 #include "dns_server.h"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cerrno>
@@ -7,8 +8,12 @@
 #include <optional>
 #include <string>
 
+#include "dns_cache.h"
+#include "dns_forwarder.h"
 #include "dns_records.h"
+#include "dns_wire.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lwip/sockets.h"
@@ -18,114 +23,17 @@ namespace {
 constexpr const char *TAG = "dns_server";
 constexpr uint16_t DNS_PORT = 53;
 constexpr size_t RX_BUFFER_SIZE = 512;
-constexpr size_t DNS_HEADER_SIZE = 12;
-constexpr size_t DNS_QNAME_MAX_LENGTH = 255;
-constexpr uint16_t DNS_TYPE_A = 1;
-constexpr uint16_t DNS_CLASS_IN = 1;
-constexpr uint16_t DNS_NAME_COMPRESSION_POINTER = 0xC00C; // pointer to offset 12 (question name)
-constexpr size_t DNS_ANSWER_RR_SIZE = 16; // 2 name-ptr + 2 type + 2 class + 4 ttl + 2 rdlength + 4 rdata
-constexpr uint32_t ANSWER_TTL_SECONDS = 60;
-constexpr uint16_t DNS_RCODE_NOERROR = 0;
-constexpr uint16_t DNS_RCODE_NXDOMAIN = 3;
+constexpr size_t TX_BUFFER_SIZE = 512;
 
-struct dns_header_t {
-    uint16_t id;
-    uint16_t flags;
-    uint16_t qdcount;
-    uint16_t ancount;
-    uint16_t nscount;
-    uint16_t arcount;
-};
+// Upper bound on how long select() blocks with nothing else scheduling
+// a wakeup — also throttles how often the cache gets swept for expired
+// entries (see the main loop). A pending forwarder deadline can still
+// cut this shorter (see next_deadline_ms()).
+constexpr int64_t SELECT_MAX_TIMEOUT_MS = 5000;
 
-uint16_t read_uint16_be(const uint8_t *buf, size_t offset)
+int64_t now_ms()
 {
-    uint16_t value;
-    std::memcpy(&value, buf + offset, sizeof(value));
-    return ntohs(value);
-}
-
-std::optional<dns_header_t> parse_dns_header(const uint8_t *buf, size_t len)
-{
-    if (len < DNS_HEADER_SIZE) {
-        return std::nullopt;
-    }
-    dns_header_t header;
-    header.id = read_uint16_be(buf, 0);
-    header.flags = read_uint16_be(buf, 2);
-    header.qdcount = read_uint16_be(buf, 4);
-    header.ancount = read_uint16_be(buf, 6);
-    header.nscount = read_uint16_be(buf, 8);
-    header.arcount = read_uint16_be(buf, 10);
-    return header;
-}
-
-// Walks the length-prefixed labels of a question-section QNAME starting at
-// `offset`, advancing it past the terminating zero-length label. Name
-// compression pointers are rejected rather than followed: real queries never
-// use them in the question section, and doing so would let untrusted length
-// bytes drive further reads into unrelated buffer regions.
-std::optional<std::string> parse_question_name(const uint8_t *buf, size_t len, size_t &offset)
-{
-    std::string name;
-
-    while (true) {
-        if (offset >= len) {
-            return std::nullopt;
-        }
-
-        uint8_t label_len = buf[offset];
-
-        if ((label_len & 0xC0) != 0) {
-            ESP_LOGW(TAG, "compression pointer in question name, unsupported");
-            return std::nullopt;
-        }
-
-        offset += 1;
-
-        if (label_len == 0) {
-            break;
-        }
-
-        if (offset + label_len > len) {
-            return std::nullopt;
-        }
-
-        if (!name.empty()) {
-            name += '.';
-        }
-        name.append(reinterpret_cast<const char *>(buf + offset), label_len);
-        offset += label_len;
-
-        if (name.size() > DNS_QNAME_MAX_LENGTH) {
-            return std::nullopt;
-        }
-    }
-
-    return name;
-}
-
-const char *qtype_to_string(uint16_t qtype)
-{
-    switch (qtype) {
-        case DNS_TYPE_A:
-            return "A";
-        case 28:
-            return "AAAA";
-        default:
-            return "OTHER";
-    }
-}
-
-void write_uint16_be(uint8_t *buf, size_t offset, uint16_t value)
-{
-    uint16_t network_value = htons(value);
-    std::memcpy(buf + offset, &network_value, sizeof(network_value));
-}
-
-void write_uint32_be(uint8_t *buf, size_t offset, uint32_t value)
-{
-    uint32_t network_value = htonl(value);
-    std::memcpy(buf + offset, &network_value, sizeof(network_value));
+    return esp_timer_get_time() / 1000;
 }
 
 bool ascii_case_insensitive_equal(const std::string &a, const char *b)
@@ -153,83 +61,171 @@ const dns_record_t *find_dns_record(const std::string &hostname)
     return nullptr;
 }
 
-// Writes the 12-byte header common to every response this server sends:
-// ID echoed, QR=1/AA=1/RD-echoed/RCODE=rcode, QDCOUNT=1 (we always echo
-// exactly one question), NSCOUNT=0, ARCOUNT=0.
-void write_dns_response_header(uint8_t *buf, uint16_t query_id, uint16_t query_flags,
-                                uint16_t ancount, uint16_t rcode)
+void send_response(int sock, const uint8_t *buf, size_t len, const sockaddr_in &to_addr,
+                    socklen_t to_addr_len, const char *qname_for_log)
 {
-    write_uint16_be(buf, 0, query_id);
-    write_uint16_be(buf, 2, (0x8400 | (query_flags & 0x0100)) | (rcode & 0x000F));
-    write_uint16_be(buf, 4, 1); // QDCOUNT
-    write_uint16_be(buf, 6, ancount);
-    write_uint16_be(buf, 8, 0); // NSCOUNT
-    write_uint16_be(buf, 10, 0); // ARCOUNT
+    int sent = sendto(sock, buf, len, 0, reinterpret_cast<const sockaddr *>(&to_addr), to_addr_len);
+    if (sent < 0) {
+        ESP_LOGE(TAG, "sendto() failed for '%s': errno %d", qname_for_log, errno);
+    }
 }
 
-// Builds a DNS response echoing the request's question section verbatim,
-// followed by a single A-record answer that uses a compression pointer
-// back to the question name (always at offset 12, since the question is
-// always the first thing written after the header). Returns std::nullopt
-// if the response wouldn't fit tx_buffer.
-std::optional<size_t> build_a_record_response(uint16_t query_id, uint16_t query_flags,
-                                               const uint8_t *question_section,
-                                               size_t question_section_len,
-                                               const std::array<uint8_t, 4> &ip,
-                                               std::array<uint8_t, RX_BUFFER_SIZE> &tx_buffer)
+// Sends a SERVFAIL echoing the client's original question — used both
+// when forwarding can't even be attempted (table full, send failure)
+// and when an in-flight query times out with no upstream reply.
+void send_servfail(int sock, const DnsForwarder::client_context_t &client)
 {
-    const size_t total_len = DNS_HEADER_SIZE + question_section_len + DNS_ANSWER_RR_SIZE;
-    if (total_len > tx_buffer.size()) {
-        return std::nullopt;
+    uint8_t tx_buffer[TX_BUFFER_SIZE];
+    auto resp_len = build_relayed_response(
+        client.client_txn_id, client.client_query_flags, client.question_section.data(),
+        client.question_section.size(), DNS_RCODE_SERVFAIL, /*ancount=*/0,
+        /*answer_section=*/nullptr, /*answer_section_len=*/0, tx_buffer, sizeof(tx_buffer));
+    if (!resp_len) {
+        ESP_LOGW(TAG, "SERVFAIL response too large to build, dropping");
+        return;
     }
-
-    write_dns_response_header(tx_buffer.data(), query_id, query_flags, /*ancount=*/1,
-                               DNS_RCODE_NOERROR);
-    std::memcpy(tx_buffer.data() + DNS_HEADER_SIZE, question_section, question_section_len);
-
-    size_t offset = DNS_HEADER_SIZE + question_section_len;
-    write_uint16_be(tx_buffer.data(), offset, DNS_NAME_COMPRESSION_POINTER);
-    offset += 2;
-    write_uint16_be(tx_buffer.data(), offset, DNS_TYPE_A);
-    offset += 2;
-    write_uint16_be(tx_buffer.data(), offset, DNS_CLASS_IN);
-    offset += 2;
-    write_uint32_be(tx_buffer.data(), offset, ANSWER_TTL_SECONDS);
-    offset += 4;
-    write_uint16_be(tx_buffer.data(), offset, static_cast<uint16_t>(ip.size()));
-    offset += 2;
-    std::memcpy(tx_buffer.data() + offset, ip.data(), ip.size());
-    offset += ip.size();
-
-    return offset;
+    send_response(sock, tx_buffer, *resp_len, client.client_addr, client.client_addr_len,
+                  "(servfail)");
 }
 
-// Builds an authoritative NXDOMAIN response echoing the request's question
-// section, with no answer RR. The question is still echoed even on this
-// error response: real resolvers match replies to pending queries by
-// name/type/class as well as ID, so omitting it risks the reply being
-// silently discarded by a strict client.
-std::optional<size_t> build_nxdomain_response(uint16_t query_id, uint16_t query_flags,
-                                               const uint8_t *question_section,
-                                               size_t question_section_len,
-                                               std::array<uint8_t, RX_BUFFER_SIZE> &tx_buffer)
+// Handles one reply that arrived on the forwarder's upstream socket:
+// caches it and relays it to the original client.
+void handle_upstream_reply(int listen_sock, DnsForwarder &forwarder, DnsCache &cache)
 {
-    const size_t total_len = DNS_HEADER_SIZE + question_section_len;
-    if (total_len > tx_buffer.size()) {
-        return std::nullopt;
+    auto reply = forwarder.handle_upstream_readable(now_ms());
+    if (!reply) {
+        return; // already logged by the forwarder
     }
 
-    write_dns_response_header(tx_buffer.data(), query_id, query_flags, /*ancount=*/0,
-                               DNS_RCODE_NXDOMAIN);
-    std::memcpy(tx_buffer.data() + DNS_HEADER_SIZE, question_section, question_section_len);
+    uint32_t cache_ttl = reply->ancount > 0 ? reply->ttl_seconds : DNS_NEGATIVE_CACHE_TTL_SECONDS;
+    cache.insert(reply->qname_lower, reply->qtype, reply->rcode, reply->ancount,
+                 reply->answer_section, cache_ttl, now_ms());
 
-    return total_len;
+    uint8_t tx_buffer[TX_BUFFER_SIZE];
+    auto resp_len = build_relayed_response(
+        reply->client.client_txn_id, reply->client.client_query_flags,
+        reply->client.question_section.data(), reply->client.question_section.size(),
+        reply->rcode, reply->ancount, reply->answer_section.data(), reply->answer_section.size(),
+        tx_buffer, sizeof(tx_buffer));
+    if (!resp_len) {
+        ESP_LOGW(TAG, "relayed response too large to build for '%s', dropping",
+                 reply->qname_lower.c_str());
+        return;
+    }
+    send_response(listen_sock, tx_buffer, *resp_len, reply->client.client_addr,
+                  reply->client.client_addr_len, reply->qname_lower.c_str());
+}
+
+// Handles one query that arrived on the listen socket: local table,
+// then cache, then forwarding — see the design doc for why local
+// records take precedence over anything cached/forwarded.
+void handle_client_query(int listen_sock, DnsForwarder &forwarder, DnsCache &cache)
+{
+    std::array<uint8_t, RX_BUFFER_SIZE> rx_buffer;
+    sockaddr_in source_addr = {};
+    socklen_t socklen = sizeof(source_addr);
+
+    int len = recvfrom(listen_sock, rx_buffer.data(), rx_buffer.size(), 0,
+                        reinterpret_cast<sockaddr *>(&source_addr), &socklen);
+    if (len < 0) {
+        ESP_LOGE(TAG, "recvfrom() failed: errno %d", errno);
+        return;
+    }
+
+    char addr_str[16];
+    inet_ntoa_r(source_addr.sin_addr, addr_str, sizeof(addr_str));
+    ESP_LOGD(TAG, "received %d bytes from %s:%d", len, addr_str, ntohs(source_addr.sin_port));
+
+    auto header = parse_dns_header(rx_buffer.data(), len);
+    if (!header) {
+        ESP_LOGW(TAG, "packet too short for a DNS header (%d bytes), dropping", len);
+        return;
+    }
+    if (header->qdcount == 0) {
+        ESP_LOGW(TAG, "query id=%u has no question section, dropping",
+                 static_cast<unsigned>(header->id));
+        return;
+    }
+
+    size_t offset = DNS_HEADER_SIZE;
+    auto qname = parse_question_name(rx_buffer.data(), len, offset);
+    if (!qname) {
+        ESP_LOGW(TAG, "malformed/unsupported question name (id=%u), dropping",
+                 static_cast<unsigned>(header->id));
+        return;
+    }
+
+    bool has_full_question = (offset + 4 <= static_cast<size_t>(len));
+    if (!has_full_question) {
+        ESP_LOGW(TAG, "truncated question (missing qtype/qclass) for '%s' (id=%u), dropping",
+                 qname->c_str(), static_cast<unsigned>(header->id));
+        return;
+    }
+    uint16_t qtype = read_uint16_be(rx_buffer.data(), offset);
+    size_t question_section_end = offset + 4;
+    const uint8_t *question_section = rx_buffer.data() + DNS_HEADER_SIZE;
+    size_t question_section_len = question_section_end - DNS_HEADER_SIZE;
+
+    ESP_LOGI(TAG, "query for '%s' type=%s(%u) id=%u", qname->empty() ? "." : qname->c_str(),
+             qtype_to_string(qtype), static_cast<unsigned>(qtype),
+             static_cast<unsigned>(header->id));
+
+    const dns_record_t *record = find_dns_record(*qname);
+    uint8_t tx_buffer[TX_BUFFER_SIZE];
+
+    if (record != nullptr) {
+        // Local table is authoritative for this name regardless of
+        // qtype — never shadowed by cache/upstream, preserving both the
+        // "local always wins" property and the existing NXDOMAIN-for-
+        // wrong-qtype simplification (see ARCHITECTURE.md).
+        std::optional<size_t> resp_len;
+        if (qtype == DNS_TYPE_A) {
+            resp_len = build_a_record_response(header->id, header->flags, question_section,
+                                                question_section_len, record->ip, tx_buffer,
+                                                sizeof(tx_buffer));
+        } else {
+            resp_len = build_nxdomain_response(header->id, header->flags, question_section,
+                                                question_section_len, tx_buffer, sizeof(tx_buffer));
+        }
+        if (resp_len) {
+            send_response(listen_sock, tx_buffer, *resp_len, source_addr, socklen,
+                          qname->c_str());
+        }
+        return;
+    }
+
+    std::string qname_lower = lowercase_ascii(*qname);
+    const dns_cache_entry_t *cached = cache.lookup(qname_lower, qtype, now_ms());
+    if (cached != nullptr) {
+        auto resp_len = build_relayed_response(header->id, header->flags, question_section,
+                                                question_section_len, cached->rcode,
+                                                cached->ancount, cached->answer_section.data(),
+                                                cached->answer_section.size(), tx_buffer,
+                                                sizeof(tx_buffer));
+        if (resp_len) {
+            ESP_LOGI(TAG, "cache hit for '%s'", qname->c_str());
+            send_response(listen_sock, tx_buffer, *resp_len, source_addr, socklen,
+                          qname->c_str());
+        }
+        return;
+    }
+
+    bool forwarded = forwarder.forward(qname_lower, qtype, header->id, header->flags,
+                                        question_section, question_section_len, source_addr,
+                                        socklen, now_ms());
+    if (!forwarded) {
+        send_servfail(listen_sock,
+                      {header->id, header->flags,
+                       std::vector<uint8_t>(question_section,
+                                             question_section + question_section_len),
+                       source_addr, socklen});
+    }
 }
 
 void dns_server_task(void *)
 {
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    if (sock < 0) {
+    int listen_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (listen_sock < 0) {
         ESP_LOGE(TAG, "socket() failed: errno %d", errno);
         vTaskDelete(nullptr);
         return;
@@ -240,104 +236,70 @@ void dns_server_task(void *)
     dest_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     dest_addr.sin_port = htons(DNS_PORT);
 
-    if (bind(sock, reinterpret_cast<sockaddr *>(&dest_addr), sizeof(dest_addr)) < 0) {
+    if (bind(listen_sock, reinterpret_cast<sockaddr *>(&dest_addr), sizeof(dest_addr)) < 0) {
         ESP_LOGE(TAG, "bind() to port %d failed: errno %d", DNS_PORT, errno);
-        close(sock);
+        close(listen_sock);
         vTaskDelete(nullptr);
         return;
     }
     ESP_LOGI(TAG, "listening on UDP port %d", DNS_PORT);
 
-    std::array<uint8_t, RX_BUFFER_SIZE> rx_buffer;
-    std::array<uint8_t, RX_BUFFER_SIZE> tx_buffer;
+    // A forwarder that fails to start runs in a permanently-degraded
+    // mode (local table only, everything else NXDOMAIN) rather than
+    // aborting the device — see DnsForwarder::start()'s doc comment.
+    static DnsForwarder forwarder;
+    static DnsCache cache;
+    bool forwarding_enabled = forwarder.start();
+    if (!forwarding_enabled) {
+        ESP_LOGW(TAG, "forwarding unavailable; serving local table only");
+    }
 
     while (true) {
-        sockaddr_in source_addr = {};
-        socklen_t socklen = sizeof(source_addr);
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(listen_sock, &read_fds);
+        int max_fd = listen_sock;
+        if (forwarding_enabled) {
+            FD_SET(forwarder.socket_fd(), &read_fds);
+            max_fd = std::max(max_fd, forwarder.socket_fd());
+        }
 
-        int len = recvfrom(sock, rx_buffer.data(), rx_buffer.size(), 0,
-                            reinterpret_cast<sockaddr *>(&source_addr), &socklen);
-        if (len < 0) {
-            ESP_LOGE(TAG, "recvfrom() failed: errno %d", errno);
+        int64_t timeout_ms = SELECT_MAX_TIMEOUT_MS;
+        if (forwarding_enabled) {
+            int64_t deadline = forwarder.next_deadline_ms();
+            if (deadline >= 0) {
+                timeout_ms = std::max<int64_t>(0, std::min(timeout_ms, deadline - now_ms()));
+            }
+        }
+        timeval tv = {};
+        tv.tv_sec = static_cast<time_t>(timeout_ms / 1000);
+        tv.tv_usec = static_cast<suseconds_t>((timeout_ms % 1000) * 1000);
+
+        int ready = select(max_fd + 1, &read_fds, nullptr, nullptr, &tv);
+
+        if (forwarding_enabled) {
+            for (const auto &expired : forwarder.reap_expired(now_ms())) {
+                ESP_LOGW(TAG, "upstream query timed out, sending SERVFAIL");
+                send_servfail(listen_sock, expired);
+            }
+        }
+
+        if (ready < 0) {
+            if (errno != EINTR) {
+                ESP_LOGE(TAG, "select() failed: errno %d", errno);
+            }
+            continue;
+        }
+        if (ready == 0) {
+            cache.sweep_expired(now_ms());
             continue;
         }
 
-        char addr_str[16];
-        inet_ntoa_r(source_addr.sin_addr, addr_str, sizeof(addr_str));
-        ESP_LOGI(TAG, "received %d bytes from %s:%d", len, addr_str,
-                 ntohs(source_addr.sin_port));
-        ESP_LOG_BUFFER_HEXDUMP(TAG, rx_buffer.data(), len, ESP_LOG_DEBUG);
-
-        auto header = parse_dns_header(rx_buffer.data(), len);
-        if (!header) {
-            ESP_LOGW(TAG, "packet too short for a DNS header (%d bytes), dropping", len);
-            continue;
+        if (forwarding_enabled && FD_ISSET(forwarder.socket_fd(), &read_fds)) {
+            handle_upstream_reply(listen_sock, forwarder, cache);
         }
-
-        if (header->qdcount == 0) {
-            ESP_LOGW(TAG, "query id=%u has no question section, dropping",
-                     static_cast<unsigned>(header->id));
-            continue;
-        }
-
-        size_t offset = DNS_HEADER_SIZE;
-        auto qname = parse_question_name(rx_buffer.data(), len, offset);
-        if (!qname) {
-            ESP_LOGW(TAG, "malformed/unsupported question name (id=%u), dropping",
-                     static_cast<unsigned>(header->id));
-            continue;
-        }
-
-        uint16_t qtype = 0;
-        uint16_t qclass = 0;
-        size_t question_section_end = offset;
-        bool has_full_question = (offset + 4 <= static_cast<size_t>(len));
-        if (has_full_question) {
-            qtype = read_uint16_be(rx_buffer.data(), offset);
-            qclass = read_uint16_be(rx_buffer.data(), offset + 2);
-            question_section_end = offset + 4;
-        }
-        (void)qclass;
-
-        ESP_LOGI(TAG, "query for '%s' type=%s(%u) id=%u qdcount=%u",
-                 qname->empty() ? "." : qname->c_str(), qtype_to_string(qtype),
-                 static_cast<unsigned>(qtype), static_cast<unsigned>(header->id),
-                 static_cast<unsigned>(header->qdcount));
-
-        if (!has_full_question) {
-            ESP_LOGW(TAG, "truncated question (missing qtype/qclass) for '%s' (id=%u), dropping",
-                     qname->c_str(), static_cast<unsigned>(header->id));
-            continue;
-        }
-
-        const dns_record_t *record = find_dns_record(*qname);
-        std::optional<size_t> response_len;
-        if (record != nullptr && qtype == DNS_TYPE_A) {
-            response_len = build_a_record_response(
-                header->id, header->flags, rx_buffer.data() + DNS_HEADER_SIZE,
-                question_section_end - DNS_HEADER_SIZE, record->ip, tx_buffer);
-        } else {
-            response_len = build_nxdomain_response(
-                header->id, header->flags, rx_buffer.data() + DNS_HEADER_SIZE,
-                question_section_end - DNS_HEADER_SIZE, tx_buffer);
-        }
-
-        if (!response_len) {
-            ESP_LOGW(TAG, "failed to build response for '%s' (question too large), dropping",
-                     qname->c_str());
-            continue;
-        }
-
-        int sent = sendto(sock, tx_buffer.data(), *response_len, 0,
-                           reinterpret_cast<sockaddr *>(&source_addr), socklen);
-        if (sent < 0) {
-            ESP_LOGE(TAG, "sendto() failed: errno %d", errno);
-        } else if (record != nullptr && qtype == DNS_TYPE_A) {
-            ESP_LOGI(TAG, "sent A record for '%s' (%d bytes) to %s:%d", qname->c_str(), sent,
-                     addr_str, ntohs(source_addr.sin_port));
-        } else {
-            ESP_LOGI(TAG, "sent NXDOMAIN for '%s' (%d bytes) to %s:%d", qname->c_str(), sent,
-                     addr_str, ntohs(source_addr.sin_port));
+        if (FD_ISSET(listen_sock, &read_fds)) {
+            handle_client_query(listen_sock, forwarder, cache);
         }
     }
 }
@@ -346,5 +308,5 @@ void dns_server_task(void *)
 
 void dns_server_start()
 {
-    xTaskCreate(dns_server_task, "dns_server", 4096, nullptr, 5, nullptr);
+    xTaskCreate(dns_server_task, "dns_server", 6144, nullptr, 5, nullptr);
 }
