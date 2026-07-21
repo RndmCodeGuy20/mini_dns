@@ -1,18 +1,21 @@
 #include "http_server.h"
 
 #include <array>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <string>
 
+#include "admin_credentials.h"
 #include "cJSON.h"
 #include "dns_blocklist.h"
 #include "dns_cache.h"
 #include "dns_forwarder.h"
 #include "dns_metrics.h"
-#include "dns_records.h"
+#include "dns_record_store.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "mbedtls/base64.h"
 
 namespace {
 
@@ -70,22 +73,207 @@ std::string ip_to_string(const std::array<uint8_t, 4> &ip)
     return std::string(buf);
 }
 
+// Strict "A.B.C.D" parse: four decimal octets 0-255, nothing else on the
+// string. Separate from (and stricter-checked-at-the-boundary than)
+// DnsRecordStore's internal parser, since this one validates untrusted
+// request bodies rather than re-parsing the store's own serialized format.
+std::optional<std::array<uint8_t, 4>> parse_ipv4(const std::string &s)
+{
+    std::array<uint8_t, 4> ip{};
+    size_t pos = 0;
+    for (int octet = 0; octet < 4; ++octet) {
+        if (pos >= s.size() || !std::isdigit(static_cast<unsigned char>(s[pos]))) {
+            return std::nullopt;
+        }
+        int value = 0;
+        int digits = 0;
+        while (pos < s.size() && std::isdigit(static_cast<unsigned char>(s[pos]))) {
+            value = value * 10 + (s[pos] - '0');
+            ++pos;
+            ++digits;
+            if (digits > 3 || value > 255) {
+                return std::nullopt;
+            }
+        }
+        ip[octet] = static_cast<uint8_t>(value);
+        if (octet < 3) {
+            if (pos >= s.size() || s[pos] != '.') {
+                return std::nullopt;
+            }
+            ++pos;
+        }
+    }
+    if (pos != s.size()) {
+        return std::nullopt;
+    }
+    return ip;
+}
+
+// Syntax check only (RFC 1035 label rules) — deliberately not aware of the
+// ".loc"/".local" TLD gotchas documented in ARCHITECTURE.md; any hostname
+// worth these rules is accepted, matching a client's own liberty to pick a
+// TLD.
+bool valid_hostname(const std::string &host)
+{
+    if (host.empty() || host.size() > 253) {
+        return false;
+    }
+    size_t label_start = 0;
+    for (size_t i = 0; i <= host.size(); ++i) {
+        if (i < host.size() && host[i] != '.') {
+            continue;
+        }
+        size_t label_len = i - label_start;
+        if (label_len == 0 || label_len > 63) {
+            return false;
+        }
+        if (host[label_start] == '-' || host[i - 1] == '-') {
+            return false;
+        }
+        for (size_t j = label_start; j < i; ++j) {
+            if (!std::isalnum(static_cast<unsigned char>(host[j])) && host[j] != '-') {
+                return false;
+            }
+        }
+        label_start = i + 1;
+    }
+    return true;
+}
+
+// Reflects the request's Origin back rather than "*": the mutating routes
+// use Basic-auth credentials, and browsers reject Access-Control-Allow-
+// Origin: * combined with credentialed requests. Effectively an open CORS
+// policy — protection comes from check_auth(), not from origin filtering.
+// Call on every /api/records handler a browser (not just curl/dig) will hit.
+//
+// `origin_buf` is an out-parameter owned by the CALLER, not this function:
+// httpd_resp_set_hdr() only stores the pointer it's given, not a copy (see
+// its doc comment — "lifetime of the field value strings [must be] valid
+// till send function is called"), so the buffer must outlive this call and
+// stay alive until the handler's own httpd_resp_send(). A local here would
+// go out of scope the moment this function returns, leaving httpd holding a
+// dangling pointer by the time the response is actually serialized.
+void add_cors_headers(httpd_req_t *req, char *origin_buf, size_t origin_buf_size)
+{
+    if (httpd_req_get_hdr_value_str(req, "Origin", origin_buf, origin_buf_size) == ESP_OK) {
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", origin_buf);
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Credentials", "true");
+    }
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Authorization,Content-Type");
+}
+
+// HTTP Basic auth, checked only on the mutating /api/records routes — every
+// GET (dashboard, /api/records, /api/blocklist, /metrics) stays open so
+// Prometheus can keep scraping unauthenticated (see Phase 3). Credentials
+// live in admin_credentials.h, gitignored like wifi_credentials.h. Sends 401
+// + WWW-Authenticate itself on failure; caller just returns on `false`.
+bool check_auth(httpd_req_t *req)
+{
+    char header[128];
+    if (httpd_req_get_hdr_value_str(req, "Authorization", header, sizeof(header)) != ESP_OK) {
+        httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"mini_dns\"");
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_send(req, nullptr, 0);
+        return false;
+    }
+
+    constexpr const char *PREFIX = "Basic ";
+    constexpr size_t PREFIX_LEN = 6;
+    std::string token(header);
+    bool ok = false;
+    if (token.rfind(PREFIX, 0) == 0) {
+        std::string encoded = token.substr(PREFIX_LEN);
+        unsigned char decoded[128];
+        size_t decoded_len = 0;
+        if (mbedtls_base64_decode(decoded, sizeof(decoded) - 1, &decoded_len,
+                                   reinterpret_cast<const unsigned char *>(encoded.c_str()),
+                                   encoded.size()) == 0) {
+            decoded[decoded_len] = '\0';
+            std::string creds(reinterpret_cast<char *>(decoded), decoded_len);
+            std::string expected = std::string(ADMIN_USER) + ':' + ADMIN_PASS;
+            ok = (creds == expected);
+        }
+    }
+
+    if (!ok) {
+        httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"mini_dns\"");
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_send(req, nullptr, 0);
+        return false;
+    }
+    return true;
+}
+
+// Reads the request body into a cJSON object. Rejects bodies over 1KB (a
+// record entry is a handful of bytes; this is generous headroom, not a
+// real capacity need) and returns nullptr on any read/parse failure —
+// callers respond 400.
+cJSON *read_json_body(httpd_req_t *req)
+{
+    if (req->content_len == 0 || req->content_len > 1024) {
+        return nullptr;
+    }
+    std::string body(req->content_len, '\0');
+    size_t received = 0;
+    while (received < req->content_len) {
+        int ret = httpd_req_recv(req, body.data() + received, req->content_len - received);
+        if (ret <= 0) {
+            return nullptr;
+        }
+        received += static_cast<size_t>(ret);
+    }
+    return cJSON_ParseWithLength(body.c_str(), body.size());
+}
+
+// Pulls {"host": "...", "ip": "..."} out of a parsed body, validating both.
+// `require_ip` is false for DELETE, which only needs the host. Sends 400
+// itself on any validation failure so callers just return on `false`.
+bool parse_record_request(httpd_req_t *req, cJSON *body, bool require_ip, std::string &host,
+                           std::array<uint8_t, 4> &ip)
+{
+    cJSON *host_item = cJSON_GetObjectItemCaseSensitive(body, "host");
+    if (!cJSON_IsString(host_item) || !valid_hostname(host_item->valuestring)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid or missing \"host\"");
+        return false;
+    }
+    host = host_item->valuestring;
+
+    if (!require_ip) {
+        return true;
+    }
+    cJSON *ip_item = cJSON_GetObjectItemCaseSensitive(body, "ip");
+    if (!cJSON_IsString(ip_item)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing \"ip\"");
+        return false;
+    }
+    auto parsed = parse_ipv4(ip_item->valuestring);
+    if (!parsed) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid \"ip\"");
+        return false;
+    }
+    ip = *parsed;
+    return true;
+}
+
 esp_err_t records_get_handler(httpd_req_t *req)
 {
+    char origin[128];
+    add_cors_headers(req, origin, sizeof(origin));
     cJSON *root = cJSON_CreateArray();
     if (root == nullptr) {
         ESP_LOGE(TAG, "Failed to allocate JSON array");
         return httpd_resp_send_500(req);
     }
 
-    for (const auto &record : DNS_RECORDS) {
+    for (const auto &record : record_store().snapshot()) {
         cJSON *entry = cJSON_CreateObject();
         if (entry == nullptr) {
             ESP_LOGE(TAG, "Failed to allocate JSON object");
             cJSON_Delete(root);
             return httpd_resp_send_500(req);
         }
-        cJSON_AddStringToObject(entry, "host", record.hostname);
+        cJSON_AddStringToObject(entry, "host", record.hostname.c_str());
         cJSON_AddStringToObject(entry, "ip", ip_to_string(record.ip).c_str());
         cJSON_AddItemToArray(root, entry);
     }
@@ -105,10 +293,134 @@ esp_err_t records_get_handler(httpd_req_t *req)
     return ret;
 }
 
-constexpr httpd_uri_t RECORDS_URI = {
+constexpr httpd_uri_t RECORDS_GET_URI = {
     .uri = "/api/records",
     .method = HTTP_GET,
     .handler = records_get_handler,
+    .user_ctx = nullptr,
+};
+
+esp_err_t records_options_handler(httpd_req_t *req)
+{
+    char origin[128];
+    add_cors_headers(req, origin, sizeof(origin));
+    httpd_resp_set_status(req, "204 No Content");
+    return httpd_resp_send(req, nullptr, 0);
+}
+
+constexpr httpd_uri_t RECORDS_OPTIONS_URI = {
+    .uri = "/api/records",
+    .method = HTTP_OPTIONS,
+    .handler = records_options_handler,
+    .user_ctx = nullptr,
+};
+
+esp_err_t records_post_handler(httpd_req_t *req)
+{
+    char origin[128];
+    add_cors_headers(req, origin, sizeof(origin));
+    if (!check_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json_body(req);
+    if (body == nullptr) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON body");
+    }
+    std::string host;
+    std::array<uint8_t, 4> ip{};
+    if (!parse_record_request(req, body, /*require_ip=*/true, host, ip)) {
+        cJSON_Delete(body);
+        return ESP_OK; // parse_record_request already sent the error response
+    }
+    cJSON_Delete(body);
+
+    switch (record_store().create(host, ip)) {
+    case DnsRecordStoreResult::kOk:
+        httpd_resp_set_status(req, "201 Created");
+        return httpd_resp_send(req, nullptr, 0);
+    case DnsRecordStoreResult::kAlreadyExists:
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "host already exists");
+    case DnsRecordStoreResult::kFull:
+    default:
+        httpd_resp_set_status(req, "507 Insufficient Storage");
+        return httpd_resp_send(req, nullptr, 0);
+    }
+}
+
+constexpr httpd_uri_t RECORDS_POST_URI = {
+    .uri = "/api/records",
+    .method = HTTP_POST,
+    .handler = records_post_handler,
+    .user_ctx = nullptr,
+};
+
+esp_err_t records_put_handler(httpd_req_t *req)
+{
+    char origin[128];
+    add_cors_headers(req, origin, sizeof(origin));
+    if (!check_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json_body(req);
+    if (body == nullptr) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON body");
+    }
+    std::string host;
+    std::array<uint8_t, 4> ip{};
+    if (!parse_record_request(req, body, /*require_ip=*/true, host, ip)) {
+        cJSON_Delete(body);
+        return ESP_OK;
+    }
+    cJSON_Delete(body);
+
+    switch (record_store().update(host, ip)) {
+    case DnsRecordStoreResult::kOk:
+        return httpd_resp_send(req, nullptr, 0);
+    case DnsRecordStoreResult::kNotFound:
+    default:
+        return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "host not found");
+    }
+}
+
+constexpr httpd_uri_t RECORDS_PUT_URI = {
+    .uri = "/api/records",
+    .method = HTTP_PUT,
+    .handler = records_put_handler,
+    .user_ctx = nullptr,
+};
+
+esp_err_t records_delete_handler(httpd_req_t *req)
+{
+    char origin[128];
+    add_cors_headers(req, origin, sizeof(origin));
+    if (!check_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json_body(req);
+    if (body == nullptr) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON body");
+    }
+    std::string host;
+    std::array<uint8_t, 4> ip{}; // unused, DELETE only needs host
+    if (!parse_record_request(req, body, /*require_ip=*/false, host, ip)) {
+        cJSON_Delete(body);
+        return ESP_OK;
+    }
+    cJSON_Delete(body);
+
+    switch (record_store().remove(host)) {
+    case DnsRecordStoreResult::kOk:
+        return httpd_resp_send(req, nullptr, 0);
+    case DnsRecordStoreResult::kNotFound:
+    default:
+        return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "host not found");
+    }
+}
+
+constexpr httpd_uri_t RECORDS_DELETE_URI = {
+    .uri = "/api/records",
+    .method = HTTP_DELETE,
+    .handler = records_delete_handler,
     .user_ctx = nullptr,
 };
 
@@ -268,10 +580,20 @@ void http_server_start()
 {
     httpd_handle_t server = nullptr;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    // Default (8) was an exact fit for the prior 4 GET-only routes; Phase 5
+    // adds POST/PUT/DELETE/OPTIONS on /api/records (8 handlers total), so
+    // bump with real headroom rather than the exact new count — the same
+    // "leave headroom, don't just +1" lesson as the Phase 1 socket-budget
+    // trap (see ARCHITECTURE.md).
+    config.max_uri_handlers = 12;
 
     ESP_ERROR_CHECK(httpd_start(&server, &config));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ROOT_URI));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &RECORDS_URI));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &RECORDS_GET_URI));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &RECORDS_POST_URI));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &RECORDS_PUT_URI));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &RECORDS_DELETE_URI));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &RECORDS_OPTIONS_URI));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &BLOCKLIST_URI));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &METRICS_URI));
 

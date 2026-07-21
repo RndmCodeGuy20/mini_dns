@@ -2,9 +2,7 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <cerrno>
-#include <cstring>
 #include <optional>
 #include <string>
 
@@ -12,7 +10,7 @@
 #include "dns_cache.h"
 #include "dns_forwarder.h"
 #include "dns_metrics.h"
-#include "dns_records.h"
+#include "dns_record_store.h"
 #include "dns_wire.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -36,31 +34,6 @@ constexpr int64_t SELECT_MAX_TIMEOUT_MS = 5000;
 int64_t now_ms()
 {
     return esp_timer_get_time() / 1000;
-}
-
-bool ascii_case_insensitive_equal(const std::string &a, const char *b)
-{
-    size_t b_len = std::strlen(b);
-    if (a.size() != b_len) {
-        return false;
-    }
-    for (size_t i = 0; i < a.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(a[i])) !=
-            std::tolower(static_cast<unsigned char>(b[i]))) {
-            return false;
-        }
-    }
-    return true;
-}
-
-const dns_record_t *find_dns_record(const std::string &hostname)
-{
-    for (const auto &record : DNS_RECORDS) {
-        if (ascii_case_insensitive_equal(hostname, record.hostname)) {
-            return &record;
-        }
-    }
-    return nullptr;
 }
 
 void send_response(int sock, const uint8_t *buf, size_t len, const sockaddr_in &to_addr,
@@ -178,10 +151,12 @@ void handle_client_query(int listen_sock, DnsForwarder &forwarder, DnsCache &cac
              static_cast<unsigned>(header->id));
     metrics().inc_queries();
 
-    const dns_record_t *record = find_dns_record(*qname);
+    // A copy, not a pointer: record_store().find() releases its internal
+    // lock before returning, by design — see dns_record_store.h.
+    std::optional<std::array<uint8_t, 4>> record_ip = record_store().find(*qname);
     uint8_t tx_buffer[TX_BUFFER_SIZE];
 
-    if (record != nullptr) {
+    if (record_ip.has_value()) {
         metrics().inc_local_hits();
         // Local table is authoritative for this name regardless of
         // qtype — never shadowed by cache/upstream, preserving both the
@@ -190,7 +165,7 @@ void handle_client_query(int listen_sock, DnsForwarder &forwarder, DnsCache &cac
         std::optional<size_t> resp_len;
         if (qtype == DNS_TYPE_A) {
             resp_len = build_a_record_response(header->id, header->flags, question_section,
-                                                question_section_len, record->ip, tx_buffer,
+                                                question_section_len, *record_ip, tx_buffer,
                                                 sizeof(tx_buffer));
         } else {
             resp_len = build_nxdomain_response(header->id, header->flags, question_section,
@@ -355,11 +330,18 @@ void dns_server_start()
 {
     // Loaded synchronously, before the task (and before http_server_start(),
     // called after this returns — see main.cpp) — so neither the first
-    // query nor the first /api/blocklist request can race an empty list.
+    // query nor the first /api/blocklist or /api/records request can race an
+    // empty list.
     esp_err_t blocklist_err = blocklist().load_from_nvs();
     if (blocklist_err != ESP_OK) {
         ESP_LOGW(TAG, "blocklist failed to load (%s); starting with an empty list",
                  esp_err_to_name(blocklist_err));
+    }
+
+    esp_err_t record_store_err = record_store().load_from_nvs();
+    if (record_store_err != ESP_OK) {
+        ESP_LOGW(TAG, "record store failed to load (%s); starting with an empty table",
+                 esp_err_to_name(record_store_err));
     }
 
     xTaskCreate(dns_server_task, "dns_server", 6144, nullptr, 5, nullptr);

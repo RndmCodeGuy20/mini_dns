@@ -1,4 +1,5 @@
 main/wifi_credentials.h
+main/admin_credentials.h
 
 build/
 managed_components/
