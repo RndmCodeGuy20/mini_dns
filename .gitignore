@@ -9,3 +9,5 @@ cmake-build-debug-esp-idf/
 .vscode/
 .claude/
 .cache/
+
+docs/superpowers/
