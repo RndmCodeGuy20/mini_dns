@@ -12,9 +12,13 @@
 // A runtime record — unlike dns_record_t (dns_records.h), hostname is owned
 // storage (std::string), since entries are created/edited/deleted at
 // runtime rather than baked in at compile time.
+//
+// A name may hold an A, an AAAA, or both (Phase 6 dual-stack) — never
+// neither: create()/update() reject a request supplying no address.
 struct DnsRecordEntry {
     std::string hostname;
-    std::array<uint8_t, 4> ip;
+    std::optional<std::array<uint8_t, 4>> ipv4;
+    std::optional<std::array<uint8_t, 16>> ipv6;
 };
 
 // Upper bound on the number of records, so a misbehaving/malicious client
@@ -26,6 +30,7 @@ enum class DnsRecordStoreResult {
     kAlreadyExists, // create(): a record for this hostname already exists
     kNotFound,      // update()/remove(): no record for this hostname
     kFull,          // create(): at DNS_RECORD_STORE_MAX_RECORDS capacity
+    kNoAddress,     // create()/update(): neither ipv4 nor ipv6 supplied
 };
 
 // The DNS record table (Phase 5) — unlike DnsCache/DnsForwarder (single-owner,
@@ -51,9 +56,12 @@ public:
     esp_err_t save_to_nvs() const;
 
     // Case-insensitive lookup for the DNS task's hot path. Returns a copy of
-    // the ip, never a pointer or reference — the lock is released before
-    // this returns, so a dangling pointer into records_ must be impossible.
-    std::optional<std::array<uint8_t, 4>> find(const std::string &hostname) const;
+    // the whole entry, never a pointer or reference — the lock is released
+    // before this returns, so a dangling pointer into records_ must be
+    // impossible. Returning the whole entry (rather than just an address)
+    // lets the caller distinguish "name exists but not for this qtype"
+    // (NODATA) from "name doesn't exist" (NXDOMAIN) — see dns_server.cpp.
+    std::optional<DnsRecordEntry> find(const std::string &hostname) const;
 
     // Copies the whole table out under lock, for the HTTP task's GET
     // /api/records handler to serialize without touching records_ unlocked.
@@ -62,8 +70,18 @@ public:
     // Mutations — HTTP task only. Each locks, mutates, and persists via
     // save_to_nvs() while still holding the lock, so a reader can never
     // observe an in-memory table that doesn't match what's on flash.
-    DnsRecordStoreResult create(const std::string &hostname, const std::array<uint8_t, 4> &ip);
-    DnsRecordStoreResult update(const std::string &hostname, const std::array<uint8_t, 4> &ip);
+    //
+    // create()/update() take the full desired address set for the record
+    // (PUT semantics: update() replaces both families wholesale rather than
+    // patching one). Callers must supply at least one of ipv4/ipv6 — the
+    // HTTP layer enforces this before calling in (see http_server.cpp), but
+    // both methods also refuse an all-nullopt pair defensively.
+    DnsRecordStoreResult create(const std::string &hostname,
+                                 const std::optional<std::array<uint8_t, 4>> &ipv4,
+                                 const std::optional<std::array<uint8_t, 16>> &ipv6);
+    DnsRecordStoreResult update(const std::string &hostname,
+                                 const std::optional<std::array<uint8_t, 4>> &ipv4,
+                                 const std::optional<std::array<uint8_t, 16>> &ipv6);
     DnsRecordStoreResult remove(const std::string &hostname);
 
 private:

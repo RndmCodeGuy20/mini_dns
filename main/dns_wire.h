@@ -16,6 +16,7 @@
 constexpr size_t DNS_HEADER_SIZE = 12;
 constexpr size_t DNS_QNAME_MAX_LENGTH = 255;
 constexpr uint16_t DNS_TYPE_A = 1;
+constexpr uint16_t DNS_TYPE_AAAA = 28;
 constexpr uint16_t DNS_CLASS_IN = 1;
 constexpr uint16_t DNS_NAME_COMPRESSION_POINTER = 0xC00C; // pointer to offset 12 (question name)
 constexpr size_t DNS_ANSWER_RR_FIXED_SIZE = 10; // type(2)+class(2)+ttl(4)+rdlength(2), before rdata
@@ -87,6 +88,15 @@ std::optional<size_t> build_a_record_response(uint16_t query_id, uint16_t query_
                                                const std::array<uint8_t, 4> &ip,
                                                uint8_t *tx_buffer, size_t tx_capacity);
 
+// Same as build_a_record_response, but for a single AAAA (rtype 28) answer
+// with 16-byte rdata. Shares the same compression-pointer-to-question-name
+// layout — see build_a_record_response's comment.
+std::optional<size_t> build_aaaa_record_response(uint16_t query_id, uint16_t query_flags,
+                                                  const uint8_t *question_section,
+                                                  size_t question_section_len,
+                                                  const std::array<uint8_t, 16> &ip,
+                                                  uint8_t *tx_buffer, size_t tx_capacity);
+
 // Builds an authoritative NXDOMAIN response echoing the request's question
 // section, with no answer RR. The question is still echoed even on this
 // error response: real resolvers match replies to pending queries by
@@ -96,6 +106,17 @@ std::optional<size_t> build_nxdomain_response(uint16_t query_id, uint16_t query_
                                                const uint8_t *question_section,
                                                size_t question_section_len,
                                                uint8_t *tx_buffer, size_t tx_capacity);
+
+// Builds a NOERROR response with zero answers ("NODATA" in common usage,
+// RFC 2308 §2.2): the name exists, but not for the queried type. Distinct
+// from NXDOMAIN (the name doesn't exist at all) — see the dual-stack
+// resolution path in dns_server.cpp for why this matters once a local
+// name can hold an A, an AAAA, or both: querying the absent family must
+// not tell a dual-stack client the name doesn't exist.
+std::optional<size_t> build_nodata_response(uint16_t query_id, uint16_t query_flags,
+                                             const uint8_t *question_section,
+                                             size_t question_section_len, uint8_t *tx_buffer,
+                                             size_t tx_capacity);
 
 // Builds a response by relaying a previously-captured answer section
 // (see dns_cache.h) behind a fresh header/question: used for both cache

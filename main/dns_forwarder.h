@@ -29,12 +29,18 @@ constexpr size_t DNS_FORWARDER_MAX_IN_FLIGHT = 32;
 constexpr int64_t DNS_FORWARDER_TIMEOUT_MS = 2000;
 constexpr const char *DNS_FORWARDER_UPSTREAM_IP = "1.1.1.1";
 constexpr uint16_t DNS_FORWARDER_UPSTREAM_PORT = 53;
+// Secondary upstream (Phase 6): tried once, on timeout, before giving up.
+// Same operator as the primary (Cloudflare's other anycast address) rather
+// than a second operator — this is about surviving one address being
+// unreachable, not diversifying trust.
+constexpr const char *DNS_FORWARDER_SECONDARY_IP = "1.0.0.1";
 
 class DnsForwarder {
 public:
     DnsForwarder(const char *upstream_ip = DNS_FORWARDER_UPSTREAM_IP,
                  uint16_t upstream_port = DNS_FORWARDER_UPSTREAM_PORT,
-                 int64_t timeout_ms = DNS_FORWARDER_TIMEOUT_MS);
+                 int64_t timeout_ms = DNS_FORWARDER_TIMEOUT_MS,
+                 const char *secondary_ip = DNS_FORWARDER_SECONDARY_IP);
 
     // Opens the upstream UDP client socket. Returns false on failure —
     // callers should treat this as a non-fatal degraded mode (local
@@ -87,10 +93,25 @@ public:
     // handled separately by reap_expired).
     std::optional<reply_t> handle_upstream_readable(int64_t now_ms);
 
-    // Frees and returns the client context for every in-flight slot
-    // whose deadline has passed as of now_ms, so the caller can send
-    // each one a SERVFAIL. Call once per select() loop iteration.
-    std::vector<client_context_t> reap_expired(int64_t now_ms);
+    // Result of reap_expired(): `expired` is the client context for every
+    // slot that has now definitively failed (timed out on the secondary
+    // too, or forwarding is degraded) — the caller sends each one a
+    // SERVFAIL. `retried` counts slots that had only tried the primary and
+    // were just re-sent to the secondary in place, still occupied — the
+    // caller only needs this to update a metric, not to act on the slot.
+    struct reap_result_t {
+        std::vector<client_context_t> expired;
+        size_t retried = 0;
+    };
+
+    // For every in-flight slot whose deadline has passed as of now_ms: if
+    // it's only been tried against the primary upstream, re-sends the same
+    // question to the secondary and gives it a fresh deadline (still
+    // in-flight, not returned in `expired`); if the secondary attempt has
+    // also expired (or forwarding is degraded, see forward()'s "sock_ < 0"
+    // case — a slot can't reach this state then), frees the slot and
+    // returns its client context. Call once per select() loop iteration.
+    reap_result_t reap_expired(int64_t now_ms);
 
     // Soonest deadline among in-flight slots, or -1 if none are in
     // flight — lets the caller size select()'s timeout so an expiring
@@ -105,6 +126,7 @@ public:
 private:
     struct in_flight_slot_t {
         bool occupied = false;
+        uint8_t attempt = 0; // 0 = only tried primary, 1 = retried on secondary
         uint16_t generation = 0;
         uint16_t client_txn_id = 0;
         uint16_t client_query_flags = 0;
@@ -117,9 +139,17 @@ private:
     };
 
     int sock_ = -1;
-    sockaddr_in upstream_addr_{};
+    sockaddr_in primary_addr_{};
+    sockaddr_in secondary_addr_{};
     int64_t timeout_ms_;
     std::array<in_flight_slot_t, DNS_FORWARDER_MAX_IN_FLIGHT> slots_{};
 
     int find_free_slot() const;
+    // Writes a fresh header + the slot's stored question and sends it to
+    // `upstream`, reusing the slot's already-assigned transaction ID
+    // (index + generation) — shared by forward() (first attempt) and
+    // reap_expired() (secondary retry) so the two can't drift on the wire
+    // format. Returns false on send failure.
+    bool send_to_upstream(const in_flight_slot_t &slot, const sockaddr_in &upstream,
+                          uint16_t upstream_txn_id);
 };

@@ -35,6 +35,11 @@ void DnsMetrics::inc_upstream_timeouts()
     upstream_timeouts_.fetch_add(1, std::memory_order_relaxed);
 }
 
+void DnsMetrics::inc_upstream_retries()
+{
+    upstream_retries_.fetch_add(1, std::memory_order_relaxed);
+}
+
 void DnsMetrics::inc_servfail()
 {
     servfail_.fetch_add(1, std::memory_order_relaxed);
@@ -74,6 +79,7 @@ DnsMetricsSnapshot DnsMetrics::snapshot() const
     s.forwarded = forwarded_.load(std::memory_order_relaxed);
     s.upstream_replies = upstream_replies_.load(std::memory_order_relaxed);
     s.upstream_timeouts = upstream_timeouts_.load(std::memory_order_relaxed);
+    s.upstream_retries = upstream_retries_.load(std::memory_order_relaxed);
     s.servfail = servfail_.load(std::memory_order_relaxed);
     for (size_t i = 0; i < latency_buckets_.size(); ++i) {
         s.latency_buckets[i] = latency_buckets_[i].load(std::memory_order_relaxed);

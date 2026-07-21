@@ -152,24 +152,32 @@ void handle_client_query(int listen_sock, DnsForwarder &forwarder, DnsCache &cac
     metrics().inc_queries();
 
     // A copy, not a pointer: record_store().find() releases its internal
-    // lock before returning, by design — see dns_record_store.h.
-    std::optional<std::array<uint8_t, 4>> record_ip = record_store().find(*qname);
+    // lock before returning, by design — see dns_record_store.h. The whole
+    // entry (not just one address) is needed to tell "name exists, no
+    // record of this qtype" (NODATA) apart from "name doesn't exist"
+    // (NXDOMAIN, handled below via the blocklist/forward path).
+    std::optional<DnsRecordEntry> record = record_store().find(*qname);
     uint8_t tx_buffer[TX_BUFFER_SIZE];
 
-    if (record_ip.has_value()) {
+    if (record.has_value()) {
         metrics().inc_local_hits();
         // Local table is authoritative for this name regardless of
-        // qtype — never shadowed by cache/upstream, preserving both the
-        // "local always wins" property and the existing NXDOMAIN-for-
-        // wrong-qtype simplification (see ARCHITECTURE.md).
+        // qtype — never shadowed by cache/upstream (see ARCHITECTURE.md).
+        // A name may hold an A, an AAAA, or both (Phase 6 dual-stack);
+        // querying the family it doesn't have returns NODATA rather than
+        // NXDOMAIN, since the name does exist.
         std::optional<size_t> resp_len;
-        if (qtype == DNS_TYPE_A) {
+        if (qtype == DNS_TYPE_A && record->ipv4) {
             resp_len = build_a_record_response(header->id, header->flags, question_section,
-                                                question_section_len, *record_ip, tx_buffer,
+                                                question_section_len, *record->ipv4, tx_buffer,
                                                 sizeof(tx_buffer));
+        } else if (qtype == DNS_TYPE_AAAA && record->ipv6) {
+            resp_len = build_aaaa_record_response(header->id, header->flags, question_section,
+                                                   question_section_len, *record->ipv6, tx_buffer,
+                                                   sizeof(tx_buffer));
         } else {
-            resp_len = build_nxdomain_response(header->id, header->flags, question_section,
-                                                question_section_len, tx_buffer, sizeof(tx_buffer));
+            resp_len = build_nodata_response(header->id, header->flags, question_section,
+                                              question_section_len, tx_buffer, sizeof(tx_buffer));
         }
         if (resp_len) {
             send_response(listen_sock, tx_buffer, *resp_len, source_addr, socklen,
@@ -188,9 +196,14 @@ void handle_client_query(int listen_sock, DnsForwarder &forwarder, DnsCache &cac
             resp_len = build_a_record_response(header->id, header->flags, question_section,
                                                 question_section_len, SINKHOLE_IP, tx_buffer,
                                                 sizeof(tx_buffer));
+        } else if (qtype == DNS_TYPE_AAAA) {
+            constexpr std::array<uint8_t, 16> SINKHOLE_IPV6 = {};
+            resp_len = build_aaaa_record_response(header->id, header->flags, question_section,
+                                                   question_section_len, SINKHOLE_IPV6, tx_buffer,
+                                                   sizeof(tx_buffer));
         } else {
-            resp_len = build_nxdomain_response(header->id, header->flags, question_section,
-                                                question_section_len, tx_buffer, sizeof(tx_buffer));
+            resp_len = build_nodata_response(header->id, header->flags, question_section,
+                                              question_section_len, tx_buffer, sizeof(tx_buffer));
         }
         if (resp_len) {
             ESP_LOGI(TAG, "blocked '%s'", qname->c_str());
@@ -288,8 +301,12 @@ void dns_server_task(void *)
         int ready = select(max_fd + 1, &read_fds, nullptr, nullptr, &tv);
 
         if (forwarding_enabled) {
-            for (const auto &expired : forwarder.reap_expired(now_ms())) {
-                ESP_LOGW(TAG, "upstream query timed out, sending SERVFAIL");
+            auto reaped = forwarder.reap_expired(now_ms());
+            for (size_t i = 0; i < reaped.retried; ++i) {
+                metrics().inc_upstream_retries();
+            }
+            for (const auto &expired : reaped.expired) {
+                ESP_LOGW(TAG, "upstream query timed out (primary + secondary), sending SERVFAIL");
                 metrics().inc_upstream_timeouts();
                 metrics().inc_servfail();
                 send_servfail(listen_sock, expired);

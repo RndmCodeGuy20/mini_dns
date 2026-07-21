@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <string>
 
 #include "admin_credentials.h"
@@ -15,6 +16,8 @@
 #include "dns_record_store.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "lwip/inet.h"
+#include "lwip/sockets.h"
 #include "mbedtls/base64.h"
 
 namespace {
@@ -73,6 +76,15 @@ std::string ip_to_string(const std::array<uint8_t, 4> &ip)
     return std::string(buf);
 }
 
+std::string ipv6_to_string(const std::array<uint8_t, 16> &ip)
+{
+    char buf[46]; // longest possible IPv6 text form + NUL
+    if (inet_ntop(AF_INET6, ip.data(), buf, sizeof(buf)) == nullptr) {
+        return std::string();
+    }
+    return std::string(buf);
+}
+
 // Strict "A.B.C.D" parse: four decimal octets 0-255, nothing else on the
 // string. Separate from (and stricter-checked-at-the-boundary than)
 // DnsRecordStore's internal parser, since this one validates untrusted
@@ -104,6 +116,15 @@ std::optional<std::array<uint8_t, 4>> parse_ipv4(const std::string &s)
         }
     }
     if (pos != s.size()) {
+        return std::nullopt;
+    }
+    return ip;
+}
+
+std::optional<std::array<uint8_t, 16>> parse_ipv6(const std::string &s)
+{
+    std::array<uint8_t, 16> ip{};
+    if (inet_pton(AF_INET6, s.c_str(), ip.data()) != 1) {
         return std::nullopt;
     }
     return ip;
@@ -226,11 +247,16 @@ cJSON *read_json_body(httpd_req_t *req)
     return cJSON_ParseWithLength(body.c_str(), body.size());
 }
 
-// Pulls {"host": "...", "ip": "..."} out of a parsed body, validating both.
-// `require_ip` is false for DELETE, which only needs the host. Sends 400
-// itself on any validation failure so callers just return on `false`.
-bool parse_record_request(httpd_req_t *req, cJSON *body, bool require_ip, std::string &host,
-                           std::array<uint8_t, 4> &ip)
+// Pulls {"host": "...", "ip"?: "...", "ipv6"?: "..."} out of a parsed body,
+// validating each field present. `require_address` is false for DELETE,
+// which only needs the host. For create/update, at least one of ip/ipv6
+// must be present and valid (dual-stack — Phase 6): a record with neither
+// address is meaningless, so that's rejected here rather than deferred to
+// the store. Sends 400 itself on any validation failure so callers just
+// return on `false`.
+bool parse_record_request(httpd_req_t *req, cJSON *body, bool require_address, std::string &host,
+                           std::optional<std::array<uint8_t, 4>> &ipv4,
+                           std::optional<std::array<uint8_t, 16>> &ipv6)
 {
     cJSON *host_item = cJSON_GetObjectItemCaseSensitive(body, "host");
     if (!cJSON_IsString(host_item) || !valid_hostname(host_item->valuestring)) {
@@ -239,20 +265,45 @@ bool parse_record_request(httpd_req_t *req, cJSON *body, bool require_ip, std::s
     }
     host = host_item->valuestring;
 
-    if (!require_ip) {
+    if (!require_address) {
         return true;
     }
+
+    ipv4 = std::nullopt;
+    ipv6 = std::nullopt;
+
     cJSON *ip_item = cJSON_GetObjectItemCaseSensitive(body, "ip");
-    if (!cJSON_IsString(ip_item)) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing \"ip\"");
+    if (ip_item != nullptr) {
+        if (!cJSON_IsString(ip_item)) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid \"ip\"");
+            return false;
+        }
+        auto parsed = parse_ipv4(ip_item->valuestring);
+        if (!parsed) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid \"ip\"");
+            return false;
+        }
+        ipv4 = *parsed;
+    }
+
+    cJSON *ipv6_item = cJSON_GetObjectItemCaseSensitive(body, "ipv6");
+    if (ipv6_item != nullptr) {
+        if (!cJSON_IsString(ipv6_item)) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid \"ipv6\"");
+            return false;
+        }
+        auto parsed = parse_ipv6(ipv6_item->valuestring);
+        if (!parsed) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid \"ipv6\"");
+            return false;
+        }
+        ipv6 = *parsed;
+    }
+
+    if (!ipv4 && !ipv6) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "at least one of \"ip\"/\"ipv6\" required");
         return false;
     }
-    auto parsed = parse_ipv4(ip_item->valuestring);
-    if (!parsed) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid \"ip\"");
-        return false;
-    }
-    ip = *parsed;
     return true;
 }
 
@@ -274,7 +325,12 @@ esp_err_t records_get_handler(httpd_req_t *req)
             return httpd_resp_send_500(req);
         }
         cJSON_AddStringToObject(entry, "host", record.hostname.c_str());
-        cJSON_AddStringToObject(entry, "ip", ip_to_string(record.ip).c_str());
+        if (record.ipv4) {
+            cJSON_AddStringToObject(entry, "ip", ip_to_string(*record.ipv4).c_str());
+        }
+        if (record.ipv6) {
+            cJSON_AddStringToObject(entry, "ipv6", ipv6_to_string(*record.ipv6).c_str());
+        }
         cJSON_AddItemToArray(root, entry);
     }
 
@@ -327,19 +383,22 @@ esp_err_t records_post_handler(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON body");
     }
     std::string host;
-    std::array<uint8_t, 4> ip{};
-    if (!parse_record_request(req, body, /*require_ip=*/true, host, ip)) {
+    std::optional<std::array<uint8_t, 4>> ipv4;
+    std::optional<std::array<uint8_t, 16>> ipv6;
+    if (!parse_record_request(req, body, /*require_address=*/true, host, ipv4, ipv6)) {
         cJSON_Delete(body);
         return ESP_OK; // parse_record_request already sent the error response
     }
     cJSON_Delete(body);
 
-    switch (record_store().create(host, ip)) {
+    switch (record_store().create(host, ipv4, ipv6)) {
     case DnsRecordStoreResult::kOk:
         httpd_resp_set_status(req, "201 Created");
         return httpd_resp_send(req, nullptr, 0);
     case DnsRecordStoreResult::kAlreadyExists:
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "host already exists");
+    case DnsRecordStoreResult::kNoAddress:
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "at least one of \"ip\"/\"ipv6\" required");
     case DnsRecordStoreResult::kFull:
     default:
         httpd_resp_set_status(req, "507 Insufficient Storage");
@@ -366,16 +425,19 @@ esp_err_t records_put_handler(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON body");
     }
     std::string host;
-    std::array<uint8_t, 4> ip{};
-    if (!parse_record_request(req, body, /*require_ip=*/true, host, ip)) {
+    std::optional<std::array<uint8_t, 4>> ipv4;
+    std::optional<std::array<uint8_t, 16>> ipv6;
+    if (!parse_record_request(req, body, /*require_address=*/true, host, ipv4, ipv6)) {
         cJSON_Delete(body);
         return ESP_OK;
     }
     cJSON_Delete(body);
 
-    switch (record_store().update(host, ip)) {
+    switch (record_store().update(host, ipv4, ipv6)) {
     case DnsRecordStoreResult::kOk:
         return httpd_resp_send(req, nullptr, 0);
+    case DnsRecordStoreResult::kNoAddress:
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "at least one of \"ip\"/\"ipv6\" required");
     case DnsRecordStoreResult::kNotFound:
     default:
         return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "host not found");
@@ -401,8 +463,9 @@ esp_err_t records_delete_handler(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON body");
     }
     std::string host;
-    std::array<uint8_t, 4> ip{}; // unused, DELETE only needs host
-    if (!parse_record_request(req, body, /*require_ip=*/false, host, ip)) {
+    std::optional<std::array<uint8_t, 4>> ipv4;   // unused, DELETE only needs host
+    std::optional<std::array<uint8_t, 16>> ipv6; // unused, DELETE only needs host
+    if (!parse_record_request(req, body, /*require_address=*/false, host, ipv4, ipv6)) {
         cJSON_Delete(body);
         return ESP_OK;
     }
@@ -545,8 +608,13 @@ esp_err_t metrics_get_handler(httpd_req_t *req)
     append_simple_metric(out, "dns_upstream_replies_total", "counter",
                           "Replies received from the upstream resolver", snap.upstream_replies);
     append_simple_metric(out, "dns_upstream_timeouts_total", "counter",
-                          "In-flight queries that timed out waiting on upstream",
+                          "In-flight queries that timed out waiting on upstream (after "
+                          "exhausting the secondary retry)",
                           snap.upstream_timeouts);
+    append_simple_metric(out, "dns_upstream_retries_total", "counter",
+                          "In-flight queries retried against the secondary upstream after the "
+                          "primary timed out",
+                          snap.upstream_retries);
     append_simple_metric(out, "dns_servfail_total", "counter",
                           "SERVFAIL responses sent to clients", snap.servfail);
     append_simple_metric(out, "dns_blocked_total", "counter",

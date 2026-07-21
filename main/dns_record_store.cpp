@@ -1,5 +1,6 @@
 #include "dns_record_store.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -7,6 +8,8 @@
 
 #include "dns_records.h"
 #include "esp_log.h"
+#include "lwip/inet.h"
+#include "lwip/sockets.h"
 #include "nvs.h"
 
 namespace {
@@ -20,6 +23,27 @@ std::string ip_to_string(const std::array<uint8_t, 4> &ip)
     char buf[16]; // "255.255.255.255" + NUL
     std::snprintf(buf, sizeof(buf), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
     return std::string(buf);
+}
+
+// Family is detected on read by the presence of ':' (see deserialize()),
+// so this never needs a leading tag — same shape as ip_to_string, just for
+// the wider address.
+std::string ipv6_to_string(const std::array<uint8_t, 16> &ip)
+{
+    char buf[46]; // longest possible IPv6 text form + NUL
+    if (inet_ntop(AF_INET6, ip.data(), buf, sizeof(buf)) == nullptr) {
+        return std::string();
+    }
+    return std::string(buf);
+}
+
+std::optional<std::array<uint8_t, 16>> parse_ipv6(const std::string &s)
+{
+    std::array<uint8_t, 16> ip{};
+    if (inet_pton(AF_INET6, s.c_str(), ip.data()) != 1) {
+        return std::nullopt;
+    }
+    return ip;
 }
 
 // Parses "A.B.C.D" strictly: four decimal octets 0-255, no leading zeros
@@ -58,14 +82,23 @@ std::optional<std::array<uint8_t, 4>> parse_ip(const std::string &s)
     return ip;
 }
 
-// One "hostname=A.B.C.D" line per record, matching DnsBlocklist's single-blob
+// One "hostname=A.B.C.D" and/or "hostname=<ipv6>" line per record (a
+// dual-stack record emits both lines), matching DnsBlocklist's single-blob
 // (not one-key-per-entry) NVS shape for the same reason: NVS key names cap
-// at 15 characters, well short of a domain name.
+// at 15 characters, well short of a domain name. Family is never tagged
+// explicitly — deserialize() detects it from the value's shape (a ':' means
+// IPv6, matching parse_ipv6/parse_ip below), which is also what keeps a
+// pre-Phase-6, v4-only blob readable without any migration step.
 std::string serialize(const std::vector<DnsRecordEntry> &records)
 {
     std::ostringstream out;
     for (const auto &record : records) {
-        out << record.hostname << '=' << ip_to_string(record.ip) << '\n';
+        if (record.ipv4) {
+            out << record.hostname << '=' << ip_to_string(*record.ipv4) << '\n';
+        }
+        if (record.ipv6) {
+            out << record.hostname << '=' << ipv6_to_string(*record.ipv6) << '\n';
+        }
     }
     return out.str();
 }
@@ -83,11 +116,35 @@ std::vector<DnsRecordEntry> deserialize(const std::string &blob)
         if (eq == std::string::npos) {
             continue;
         }
-        auto ip = parse_ip(line.substr(eq + 1));
-        if (!ip) {
-            continue;
+        std::string hostname = line.substr(0, eq);
+        std::string value = line.substr(eq + 1);
+
+        // Merge with an already-seen line for the same hostname (the other
+        // family), rather than assuming the two lines are adjacent.
+        auto it = std::find_if(records.begin(), records.end(),
+                                [&](const DnsRecordEntry &r) { return r.hostname == hostname; });
+
+        if (value.find(':') != std::string::npos) {
+            auto ipv6 = parse_ipv6(value);
+            if (!ipv6) {
+                continue;
+            }
+            if (it != records.end()) {
+                it->ipv6 = *ipv6;
+            } else {
+                records.push_back({hostname, std::nullopt, *ipv6});
+            }
+        } else {
+            auto ipv4 = parse_ip(value);
+            if (!ipv4) {
+                continue;
+            }
+            if (it != records.end()) {
+                it->ipv4 = *ipv4;
+            } else {
+                records.push_back({hostname, *ipv4, std::nullopt});
+            }
         }
-        records.push_back({line.substr(0, eq), *ip});
     }
     return records;
 }
@@ -126,7 +183,7 @@ esp_err_t DnsRecordStore::load_from_nvs()
         // so every later boot loads from NVS instead of this array.
         records_.clear();
         for (const auto &def : DNS_RECORDS_DEFAULTS) {
-            records_.push_back({def.hostname, def.ip});
+            records_.push_back({def.hostname, def.ip, std::nullopt});
         }
         nvs_close(handle);
         ESP_LOGI(TAG, "no NVS record table found, seeding %u default record(s)",
@@ -204,14 +261,14 @@ int DnsRecordStore::find_index_locked(const std::string &hostname) const
     return -1;
 }
 
-std::optional<std::array<uint8_t, 4>> DnsRecordStore::find(const std::string &hostname) const
+std::optional<DnsRecordEntry> DnsRecordStore::find(const std::string &hostname) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     int idx = find_index_locked(hostname);
     if (idx < 0) {
         return std::nullopt;
     }
-    return records_[static_cast<size_t>(idx)].ip; // copy — lock released on return
+    return records_[static_cast<size_t>(idx)]; // copy — lock released on return
 }
 
 std::vector<DnsRecordEntry> DnsRecordStore::snapshot() const
@@ -221,29 +278,40 @@ std::vector<DnsRecordEntry> DnsRecordStore::snapshot() const
 }
 
 DnsRecordStoreResult DnsRecordStore::create(const std::string &hostname,
-                                             const std::array<uint8_t, 4> &ip)
+                                             const std::optional<std::array<uint8_t, 4>> &ipv4,
+                                             const std::optional<std::array<uint8_t, 16>> &ipv6)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!ipv4 && !ipv6) {
+        return DnsRecordStoreResult::kNoAddress; // defensive; HTTP layer already rejects this
+    }
     if (find_index_locked(hostname) >= 0) {
         return DnsRecordStoreResult::kAlreadyExists;
     }
     if (records_.size() >= DNS_RECORD_STORE_MAX_RECORDS) {
         return DnsRecordStoreResult::kFull;
     }
-    records_.push_back({hostname, ip});
+    records_.push_back({hostname, ipv4, ipv6});
     save_to_nvs();
     return DnsRecordStoreResult::kOk;
 }
 
 DnsRecordStoreResult DnsRecordStore::update(const std::string &hostname,
-                                             const std::array<uint8_t, 4> &ip)
+                                             const std::optional<std::array<uint8_t, 4>> &ipv4,
+                                             const std::optional<std::array<uint8_t, 16>> &ipv6)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!ipv4 && !ipv6) {
+        return DnsRecordStoreResult::kNoAddress; // defensive; HTTP layer already rejects this
+    }
     int idx = find_index_locked(hostname);
     if (idx < 0) {
         return DnsRecordStoreResult::kNotFound;
     }
-    records_[static_cast<size_t>(idx)].ip = ip;
+    // Full replace (PUT semantics): the stored address set becomes exactly
+    // what was supplied, not a merge with what was there before.
+    records_[static_cast<size_t>(idx)].ipv4 = ipv4;
+    records_[static_cast<size_t>(idx)].ipv6 = ipv6;
     save_to_nvs();
     return DnsRecordStoreResult::kOk;
 }

@@ -178,21 +178,29 @@ const char *qtype_to_string(uint16_t qtype)
     switch (qtype) {
         case DNS_TYPE_A:
             return "A";
-        case 28:
+        case DNS_TYPE_AAAA:
             return "AAAA";
         default:
             return "OTHER";
     }
 }
 
-std::optional<size_t> build_a_record_response(uint16_t query_id, uint16_t query_flags,
-                                               const uint8_t *question_section,
-                                               size_t question_section_len,
-                                               const std::array<uint8_t, 4> &ip,
-                                               uint8_t *tx_buffer, size_t tx_capacity)
+namespace {
+
+// Shared tail for build_a_record_response/build_aaaa_record_response: both
+// write a header + echoed question + a single answer RR that's identical
+// except for rtype and rdata width (4 bytes for A, 16 for AAAA). Factored
+// out so the two builders can't drift on the surrounding fixed fields.
+std::optional<size_t> build_address_record_response(uint16_t query_id, uint16_t query_flags,
+                                                      const uint8_t *question_section,
+                                                      size_t question_section_len,
+                                                      uint16_t rtype, const uint8_t *rdata,
+                                                      size_t rdata_len, uint8_t *tx_buffer,
+                                                      size_t tx_capacity)
 {
-    constexpr size_t DNS_ANSWER_RR_SIZE = 16; // 2 name-ptr + 2 type + 2 class + 4 ttl + 2 rdlength + 4 rdata
-    const size_t total_len = DNS_HEADER_SIZE + question_section_len + DNS_ANSWER_RR_SIZE;
+    // 2 name-ptr + 2 type + 2 class + 4 ttl + 2 rdlength + rdata
+    const size_t answer_rr_size = 12 + rdata_len;
+    const size_t total_len = DNS_HEADER_SIZE + question_section_len + answer_rr_size;
     if (total_len > tx_capacity) {
         return std::nullopt;
     }
@@ -203,18 +211,42 @@ std::optional<size_t> build_a_record_response(uint16_t query_id, uint16_t query_
     size_t offset = DNS_HEADER_SIZE + question_section_len;
     write_uint16_be(tx_buffer, offset, DNS_NAME_COMPRESSION_POINTER);
     offset += 2;
-    write_uint16_be(tx_buffer, offset, DNS_TYPE_A);
+    write_uint16_be(tx_buffer, offset, rtype);
     offset += 2;
     write_uint16_be(tx_buffer, offset, DNS_CLASS_IN);
     offset += 2;
     write_uint32_be(tx_buffer, offset, 60); // ANSWER_TTL_SECONDS, matches prior behavior
     offset += 4;
-    write_uint16_be(tx_buffer, offset, static_cast<uint16_t>(ip.size()));
+    write_uint16_be(tx_buffer, offset, static_cast<uint16_t>(rdata_len));
     offset += 2;
-    std::memcpy(tx_buffer + offset, ip.data(), ip.size());
-    offset += ip.size();
+    std::memcpy(tx_buffer + offset, rdata, rdata_len);
+    offset += rdata_len;
 
     return offset;
+}
+
+} // namespace
+
+std::optional<size_t> build_a_record_response(uint16_t query_id, uint16_t query_flags,
+                                               const uint8_t *question_section,
+                                               size_t question_section_len,
+                                               const std::array<uint8_t, 4> &ip,
+                                               uint8_t *tx_buffer, size_t tx_capacity)
+{
+    return build_address_record_response(query_id, query_flags, question_section,
+                                          question_section_len, DNS_TYPE_A, ip.data(), ip.size(),
+                                          tx_buffer, tx_capacity);
+}
+
+std::optional<size_t> build_aaaa_record_response(uint16_t query_id, uint16_t query_flags,
+                                                  const uint8_t *question_section,
+                                                  size_t question_section_len,
+                                                  const std::array<uint8_t, 16> &ip,
+                                                  uint8_t *tx_buffer, size_t tx_capacity)
+{
+    return build_address_record_response(query_id, query_flags, question_section,
+                                          question_section_len, DNS_TYPE_AAAA, ip.data(),
+                                          ip.size(), tx_buffer, tx_capacity);
 }
 
 std::optional<size_t> build_nxdomain_response(uint16_t query_id, uint16_t query_flags,
@@ -229,6 +261,22 @@ std::optional<size_t> build_nxdomain_response(uint16_t query_id, uint16_t query_
 
     write_dns_response_header(tx_buffer, query_id, query_flags, /*ancount=*/0,
                                DNS_RCODE_NXDOMAIN);
+    std::memcpy(tx_buffer + DNS_HEADER_SIZE, question_section, question_section_len);
+
+    return total_len;
+}
+
+std::optional<size_t> build_nodata_response(uint16_t query_id, uint16_t query_flags,
+                                             const uint8_t *question_section,
+                                             size_t question_section_len, uint8_t *tx_buffer,
+                                             size_t tx_capacity)
+{
+    const size_t total_len = DNS_HEADER_SIZE + question_section_len;
+    if (total_len > tx_capacity) {
+        return std::nullopt;
+    }
+
+    write_dns_response_header(tx_buffer, query_id, query_flags, /*ancount=*/0, DNS_RCODE_NOERROR);
     std::memcpy(tx_buffer + DNS_HEADER_SIZE, question_section, question_section_len);
 
     return total_len;

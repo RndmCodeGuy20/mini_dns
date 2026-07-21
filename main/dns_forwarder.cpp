@@ -39,12 +39,17 @@ uint16_t make_upstream_txn_id(size_t slot_index, uint16_t generation)
 }
 } // namespace
 
-DnsForwarder::DnsForwarder(const char *upstream_ip, uint16_t upstream_port, int64_t timeout_ms)
+DnsForwarder::DnsForwarder(const char *upstream_ip, uint16_t upstream_port, int64_t timeout_ms,
+                           const char *secondary_ip)
     : timeout_ms_(timeout_ms)
 {
-    upstream_addr_.sin_family = AF_INET;
-    upstream_addr_.sin_port = htons(upstream_port);
-    upstream_addr_.sin_addr.s_addr = inet_addr(upstream_ip);
+    primary_addr_.sin_family = AF_INET;
+    primary_addr_.sin_port = htons(upstream_port);
+    primary_addr_.sin_addr.s_addr = inet_addr(upstream_ip);
+
+    secondary_addr_.sin_family = AF_INET;
+    secondary_addr_.sin_port = htons(upstream_port);
+    secondary_addr_.sin_addr.s_addr = inet_addr(secondary_ip);
 }
 
 bool DnsForwarder::start()
@@ -55,8 +60,9 @@ bool DnsForwarder::start()
                  errno);
         return false;
     }
-    ESP_LOGI(TAG, "forwarding to upstream %s:%d", DNS_FORWARDER_UPSTREAM_IP,
-             ntohs(upstream_addr_.sin_port));
+    ESP_LOGI(TAG, "forwarding to upstream %s:%d (secondary %s:%d)", DNS_FORWARDER_UPSTREAM_IP,
+             ntohs(primary_addr_.sin_port), DNS_FORWARDER_SECONDARY_IP,
+             ntohs(secondary_addr_.sin_port));
     return true;
 }
 
@@ -94,6 +100,7 @@ bool DnsForwarder::forward(const std::string &qname_lower, uint16_t qtype,
 
     in_flight_slot_t &slot = slots_[static_cast<size_t>(index)];
     slot.generation = static_cast<uint16_t>((slot.generation + 1) & (GENERATION_MASK >> SLOT_INDEX_BITS));
+    slot.attempt = 0;
     slot.client_txn_id = client_txn_id;
     slot.client_query_flags = client_query_flags;
     slot.qtype = qtype;
@@ -105,6 +112,18 @@ bool DnsForwarder::forward(const std::string &qname_lower, uint16_t qtype,
 
     uint16_t upstream_txn_id = make_upstream_txn_id(static_cast<size_t>(index), slot.generation);
 
+    if (!send_to_upstream(slot, primary_addr_, upstream_txn_id)) {
+        slot.occupied = false;
+        return false;
+    }
+
+    slot.occupied = true;
+    return true;
+}
+
+bool DnsForwarder::send_to_upstream(const in_flight_slot_t &slot, const sockaddr_in &upstream,
+                                    uint16_t upstream_txn_id)
+{
     uint8_t query_buf[UPSTREAM_TX_BUFFER_SIZE];
     write_uint16_be(query_buf, 0, upstream_txn_id);
     write_uint16_be(query_buf, 2, 0x0100); // standard query, RD=1
@@ -112,19 +131,16 @@ bool DnsForwarder::forward(const std::string &qname_lower, uint16_t qtype,
     write_uint16_be(query_buf, 6, 0);
     write_uint16_be(query_buf, 8, 0);
     write_uint16_be(query_buf, 10, 0);
-    std::memcpy(query_buf + DNS_HEADER_SIZE, question_section, question_section_len);
+    std::memcpy(query_buf + DNS_HEADER_SIZE, slot.question_section.data(),
+                slot.question_section.size());
 
-    size_t query_len = DNS_HEADER_SIZE + question_section_len;
+    size_t query_len = DNS_HEADER_SIZE + slot.question_section.size();
     int sent = sendto(sock_, query_buf, query_len, 0,
-                       reinterpret_cast<const sockaddr *>(&upstream_addr_),
-                       sizeof(upstream_addr_));
+                       reinterpret_cast<const sockaddr *>(&upstream), sizeof(upstream));
     if (sent < 0) {
         ESP_LOGE(TAG, "sendto(upstream) failed: errno %d", errno);
-        slot.occupied = false;
         return false;
     }
-
-    slot.occupied = true;
     return true;
 }
 
@@ -141,8 +157,16 @@ std::optional<DnsForwarder::reply_t> DnsForwarder::handle_upstream_readable(int6
         return std::nullopt;
     }
 
-    if (from_addr.sin_addr.s_addr != upstream_addr_.sin_addr.s_addr ||
-        from_addr.sin_port != upstream_addr_.sin_port) {
+    // Accept a reply from either upstream: a retried slot's secondary
+    // attempt is a valid answer, and so is a primary reply that happens to
+    // arrive late (after a retry already fired) for the same slot — the
+    // slot/generation check below is what actually authenticates the
+    // reply, this is just "did it come from an upstream we asked."
+    bool from_primary = from_addr.sin_addr.s_addr == primary_addr_.sin_addr.s_addr &&
+                        from_addr.sin_port == primary_addr_.sin_port;
+    bool from_secondary = from_addr.sin_addr.s_addr == secondary_addr_.sin_addr.s_addr &&
+                          from_addr.sin_port == secondary_addr_.sin_port;
+    if (!from_primary && !from_secondary) {
         ESP_LOGW(TAG, "reply from unexpected source, dropping");
         return std::nullopt;
     }
@@ -200,18 +224,39 @@ std::optional<DnsForwarder::reply_t> DnsForwarder::handle_upstream_readable(int6
     return reply;
 }
 
-std::vector<DnsForwarder::client_context_t> DnsForwarder::reap_expired(int64_t now_ms)
+DnsForwarder::reap_result_t DnsForwarder::reap_expired(int64_t now_ms)
 {
-    std::vector<client_context_t> expired;
-    for (auto &slot : slots_) {
-        if (slot.occupied && slot.deadline_ms <= now_ms) {
-            expired.push_back({slot.client_txn_id, slot.client_query_flags,
-                                std::move(slot.question_section), slot.client_addr,
-                                slot.client_addr_len});
-            slot.occupied = false;
+    reap_result_t result;
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        in_flight_slot_t &slot = slots_[i];
+        if (!slot.occupied || slot.deadline_ms > now_ms) {
+            continue;
         }
+
+        if (slot.attempt == 0) {
+            // First attempt (primary) timed out: retry once against the
+            // secondary, reusing the same slot's transaction ID (index +
+            // generation are unchanged, so a late primary reply can still
+            // match this slot — see handle_upstream_readable). Stays
+            // occupied; not reported as expired to the caller.
+            uint16_t upstream_txn_id = make_upstream_txn_id(i, slot.generation);
+            slot.attempt = 1;
+            slot.deadline_ms = now_ms + timeout_ms_;
+            if (send_to_upstream(slot, secondary_addr_, upstream_txn_id)) {
+                ++result.retried;
+                continue;
+            }
+            // Secondary send failed outright — no point waiting out a
+            // second deadline for a send that never went anywhere; fall
+            // through and give up on this slot now.
+        }
+
+        result.expired.push_back({slot.client_txn_id, slot.client_query_flags,
+                                   std::move(slot.question_section), slot.client_addr,
+                                   slot.client_addr_len});
+        slot.occupied = false;
     }
-    return expired;
+    return result;
 }
 
 int64_t DnsForwarder::next_deadline_ms() const

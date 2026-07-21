@@ -37,6 +37,7 @@ struct DnsMetricsSnapshot {
     uint32_t forwarded = 0;
     uint32_t upstream_replies = 0;
     uint32_t upstream_timeouts = 0;
+    uint32_t upstream_retries = 0;
     uint32_t servfail = 0;
     std::array<uint32_t, DNS_METRICS_LATENCY_BUCKET_COUNT> latency_buckets{};
     uint64_t latency_sum_ms = 0;
@@ -54,6 +55,12 @@ public:
     void inc_forwarded();
     void inc_upstream_replies();
     void inc_upstream_timeouts();
+    // Bumped once per slot retried against the secondary upstream after
+    // the primary's attempt timed out (Phase 6) — distinct from
+    // upstream_timeouts, which now only counts *final* give-ups (the
+    // secondary attempt also timing out), not the first-attempt timeout
+    // that triggered the retry.
+    void inc_upstream_retries();
     void inc_servfail();
 
     // Records one upstream round-trip time into the latency histogram:
@@ -79,6 +86,7 @@ private:
     std::atomic<uint32_t> forwarded_{0};
     std::atomic<uint32_t> upstream_replies_{0};
     std::atomic<uint32_t> upstream_timeouts_{0};
+    std::atomic<uint32_t> upstream_retries_{0};
     std::atomic<uint32_t> servfail_{0};
 
     std::array<std::atomic<uint32_t>, DNS_METRICS_LATENCY_BUCKET_COUNT> latency_buckets_{};
