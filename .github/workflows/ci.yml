@@ -32,6 +32,7 @@ jobs:
 
       - name: Build firmware
         run: |
+          . "$IDF_PATH/export.sh"
           idf.py set-target esp32s3
           idf.py build
 
@@ -45,7 +46,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build host_test (linux target)
-        run: idf.py --preview set-target linux -C host_test build
+        run: |
+          . "$IDF_PATH/export.sh"
+          idf.py --preview set-target linux -C host_test build
 
       - name: Run host tests
         run: ./host_test/build/host_test.elf
@@ -81,6 +84,7 @@ jobs:
 
       - name: Build firmware
         run: |
+          . "$IDF_PATH/export.sh"
           idf.py set-target esp32s3
           idf.py build
 
