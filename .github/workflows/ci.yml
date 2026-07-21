@@ -46,9 +46,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build host_test (linux target)
+        working-directory: host_test
         run: |
           . "$IDF_PATH/export.sh"
-          idf.py --preview set-target linux -C host_test build
+          idf.py --preview set-target linux build
 
       - name: Run host tests
         run: ./host_test/build/host_test.elf
