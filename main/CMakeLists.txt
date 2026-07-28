@@ -4,7 +4,8 @@
 idf_component_register(SRCS "main.cpp" "wifi_connect.cpp" "dns_server.cpp" "dns_wire.cpp"
                             "dns_cache.cpp" "dns_forwarder.cpp" "dns_blocklist.cpp"
                             "dns_metrics.cpp" "dns_record_store.cpp" "http_server.cpp"
-                            "mdns_responder.cpp" "ota_version.cpp"
+                            "mdns_responder.cpp" "ota_version.cpp" "ota_updater.cpp"
                     INCLUDE_DIRS "."
                     REQUIRES esp_wifi esp_netif esp_event nvs_flash lwip esp_http_server json
-                             esp_psram esp_timer mdns mbedtls)
+                             esp_psram esp_timer mdns mbedtls app_update esp_https_ota
+                             esp_http_client)
