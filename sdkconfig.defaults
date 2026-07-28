@@ -23,3 +23,21 @@ CONFIG_SPIRAM_IGNORE_NOTFOUND=y
 # httpd_start() abort/reboot loop the first time this shipped. Set with
 # real headroom, not just "old total + 2", since the cost is negligible.
 CONFIG_LWIP_MAX_SOCKETS=16
+
+# Phase 7a: dual ota_0/ota_1 slots (see partitions.csv) + bootloader
+# rollback support — a slot that fails its post-update health check
+# reverts to the previous slot on next reset instead of bricking.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# App-image signature check without full Secure Boot v2 — deliberately
+# NOT enabling secure boot itself (burns eFuses irreversibly, ends
+# iteration on this dev board; see ARCHITECTURE.md non-goals). This is a
+# software-only signature check the bootloader runs on OTA update, using
+# a key that isn't burned into hardware.
+CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT=y
+CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT=y
+CONFIG_SECURE_BOOT_SIGNING_KEY="secure_boot_signing_key.pem"
+
+# GitHub's API and release-asset CDN are both signed by public CAs already
+# in ESP-IDF's bundled root store — no custom CA needed for OTA fetches.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
