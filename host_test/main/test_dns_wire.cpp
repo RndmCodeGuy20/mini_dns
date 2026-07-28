@@ -11,7 +11,25 @@
 #include <vector>
 
 #include "dns_wire.h"
+#include "ota_version.h"
 #include "unity.h"
+
+// test_ota_version.cpp's tests (Phase 7a) — plain (non-anonymous-namespace)
+// functions there so they're callable here; this file owns the single
+// merged app_main (see below), so its RUN_TEST calls need these declared.
+void test_parse_valid_with_v_prefix();
+void test_parse_valid_without_v_prefix();
+void test_parse_tolerates_git_describe_suffix();
+void test_parse_rejects_empty();
+void test_parse_rejects_garbage();
+void test_parse_rejects_missing_minor();
+void test_is_newer_minor_bump();
+void test_is_newer_false_when_older();
+void test_is_newer_false_when_equal();
+void test_is_newer_patch_bump();
+void test_is_newer_major_beats_minor_and_patch();
+void test_is_newer_false_on_unparseable_remote();
+void test_is_newer_false_on_unparseable_current();
 
 namespace {
 
@@ -380,6 +398,22 @@ extern "C" void app_main(void)
 {
     UNITY_BEGIN();
     unity_run_all_tests();
+    // ota_version tests use plain RUN_TEST rather than TEST_CASE
+    // auto-registration (see test_ota_version.cpp), so they run here
+    // explicitly rather than via unity_run_all_tests() above.
+    RUN_TEST(test_parse_valid_with_v_prefix);
+    RUN_TEST(test_parse_valid_without_v_prefix);
+    RUN_TEST(test_parse_tolerates_git_describe_suffix);
+    RUN_TEST(test_parse_rejects_empty);
+    RUN_TEST(test_parse_rejects_garbage);
+    RUN_TEST(test_parse_rejects_missing_minor);
+    RUN_TEST(test_is_newer_minor_bump);
+    RUN_TEST(test_is_newer_false_when_older);
+    RUN_TEST(test_is_newer_false_when_equal);
+    RUN_TEST(test_is_newer_patch_bump);
+    RUN_TEST(test_is_newer_major_beats_minor_and_patch);
+    RUN_TEST(test_is_newer_false_on_unparseable_remote);
+    RUN_TEST(test_is_newer_false_on_unparseable_current);
     // ESP-IDF's linux-target port starts the FreeRTOS scheduler before
     // calling app_main and never tears it down when app_main returns —
     // the process would otherwise hang forever after printing results.
