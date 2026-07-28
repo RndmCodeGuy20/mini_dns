@@ -23,7 +23,11 @@ struct OtaCheckStatus {
     bool checked = false;         // false until the first check cycle has run
     bool in_progress = false;     // a check-and-update cycle is currently running
     bool update_available = false;
-    std::string latest_version;   // empty until checked = true
+    // Most recent tag this device successfully parsed from GitHub, if any.
+    // May be populated even when last_error is non-empty — e.g. the release
+    // parsed fine but had no mini_dns.bin asset. Stays empty only if no
+    // release's tag_name has ever been read successfully.
+    std::string latest_version;
     std::string last_error;       // empty on success
 };
 OtaCheckStatus ota_updater_last_check();

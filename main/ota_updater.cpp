@@ -35,6 +35,13 @@ constexpr const char *USER_AGENT = "mini_dns-ota-updater";
 // enough that a healthy device doesn't sit "pending verify" for long.
 constexpr int64_t HEALTH_GATE_MIN_UPTIME_US = 30LL * 1000 * 1000;
 
+// A failed check (rate-limited, DNS broken, no asset, etc.) is usually not
+// transient on a device-restart timescale — without a cooldown, a naive
+// dashboard retry loop can trigger a fresh check every ~5s forever. One
+// fixed window, no backoff: this only needs to stop hammering, not be
+// clever about it.
+constexpr int64_t OTA_FAILURE_COOLDOWN_US = 30LL * 1000 * 1000;
+
 // Response bodies from the GitHub API are capped here — generous headroom
 // for a release with a handful of asset entries (tag_name appears near
 // the top of the JSON regardless), not a real capacity need.
@@ -46,6 +53,9 @@ constexpr size_t MAX_RESPONSE_BYTES = 16384;
 std::atomic<bool> s_valid_marked{false};
 std::atomic<bool> s_check_requested{false};
 std::atomic<bool> s_check_in_progress{false};
+// esp_timer_get_time() of the last failed check cycle, 0 if none yet —
+// gates ota_updater_request_check() during the cooldown window.
+std::atomic<int64_t> s_last_failure_us{0};
 
 // Written only by the background task; read via ota_updater_last_check().
 // A single mutex-free struct copy is acceptable here for the same reason
@@ -146,9 +156,16 @@ void run_check_cycle()
 
     std::string tag, asset_url, error;
     if (!fetch_latest_release(tag, asset_url, error)) {
+        // tag may already be valid even though this call failed overall —
+        // e.g. tag_name parsed fine but no mini_dns.bin asset was found.
+        // Surface it anyway so /api/ota shows the real latest tag alongside
+        // the error instead of an empty string indistinguishable from
+        // "never checked".
+        status.latest_version = tag;
         status.last_error = error;
         s_last_check = status;
         s_check_in_progress = false;
+        s_last_failure_us = esp_timer_get_time();
         ESP_LOGW(TAG, "release check failed: %s", error.c_str());
         return;
     }
@@ -189,6 +206,7 @@ void run_check_cycle()
     ESP_LOGE(TAG, "%s", status.last_error.c_str());
     s_last_check = status;
     s_check_in_progress = false;
+    s_last_failure_us = esp_timer_get_time();
 }
 
 void ota_task(void *)
@@ -245,6 +263,9 @@ OtaCheckStatus ota_updater_last_check()
 bool ota_updater_request_check()
 {
     if (s_check_in_progress) {
+        return false;
+    }
+    if (esp_timer_get_time() - s_last_failure_us < OTA_FAILURE_COOLDOWN_US) {
         return false;
     }
     s_check_requested = true;
