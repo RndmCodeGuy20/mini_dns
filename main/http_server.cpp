@@ -14,11 +14,13 @@
 #include "dns_forwarder.h"
 #include "dns_metrics.h"
 #include "dns_record_store.h"
+#include "esp_app_desc.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 #include "mbedtls/base64.h"
+#include "ota_updater.h"
 
 namespace {
 
@@ -642,6 +644,75 @@ constexpr httpd_uri_t METRICS_URI = {
     .user_ctx = nullptr,
 };
 
+esp_err_t ota_get_handler(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (root == nullptr) {
+        ESP_LOGE(TAG, "Failed to allocate JSON object");
+        return httpd_resp_send_500(req);
+    }
+
+    cJSON_AddStringToObject(root, "running_version", esp_app_get_description()->version);
+    cJSON_AddStringToObject(root, "health_state",
+                             ota_updater_health_state() == OtaHealthState::kValid
+                                 ? "valid"
+                                 : "pending_verify");
+
+    OtaCheckStatus status = ota_updater_last_check();
+    cJSON_AddBoolToObject(root, "checked", status.checked);
+    cJSON_AddBoolToObject(root, "check_in_progress", status.in_progress);
+    cJSON_AddBoolToObject(root, "update_available", status.update_available);
+    cJSON_AddStringToObject(root, "latest_version", status.latest_version.c_str());
+    cJSON_AddStringToObject(root, "last_error", status.last_error.c_str());
+
+    char *json_str = cJSON_PrintUnformatted(root);
+    if (json_str == nullptr) {
+        ESP_LOGE(TAG, "Failed to serialize JSON");
+        cJSON_Delete(root);
+        return httpd_resp_send_500(req);
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t ret = httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+
+    cJSON_free(json_str);
+    cJSON_Delete(root);
+    return ret;
+}
+
+constexpr httpd_uri_t OTA_GET_URI = {
+    .uri = "/api/ota",
+    .method = HTTP_GET,
+    .handler = ota_get_handler,
+    .user_ctx = nullptr,
+};
+
+// Auth-gated like the /api/records mutating routes (check_auth,
+// http_server.cpp:192) — an unauthenticated caller shouldn't be able to
+// trigger a multi-MB download and reboot cycle.
+esp_err_t ota_check_post_handler(httpd_req_t *req)
+{
+    if (!check_auth(req)) {
+        return ESP_OK;
+    }
+    if (!ota_updater_request_check()) {
+        // No HTTPD_409_CONFLICT in this esp_http_server version's status enum
+        // (only through 431) — set the status line directly, same pattern as
+        // check_auth()'s 401 above.
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_send(req, "check already in progress", HTTPD_RESP_USE_STRLEN);
+    }
+    httpd_resp_set_status(req, "202 Accepted");
+    return httpd_resp_send(req, nullptr, 0);
+}
+
+constexpr httpd_uri_t OTA_CHECK_POST_URI = {
+    .uri = "/api/ota/check",
+    .method = HTTP_POST,
+    .handler = ota_check_post_handler,
+    .user_ctx = nullptr,
+};
+
 } // namespace
 
 void http_server_start()
@@ -653,7 +724,7 @@ void http_server_start()
     // bump with real headroom rather than the exact new count — the same
     // "leave headroom, don't just +1" lesson as the Phase 1 socket-budget
     // trap (see ARCHITECTURE.md).
-    config.max_uri_handlers = 12;
+    config.max_uri_handlers = 14; // was 12; +2 for /api/ota, /api/ota/check
 
     ESP_ERROR_CHECK(httpd_start(&server, &config));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ROOT_URI));
@@ -664,6 +735,8 @@ void http_server_start()
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &RECORDS_OPTIONS_URI));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &BLOCKLIST_URI));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &METRICS_URI));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &OTA_GET_URI));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &OTA_CHECK_POST_URI));
 
     ESP_LOGI(TAG, "HTTP server listening on port %d", config.server_port);
 }
