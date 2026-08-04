@@ -88,6 +88,33 @@
           "legendFormat": "timeout rate"
         }
       ]
+    },
+    {
+      "id": 7,
+      "title": "Device health",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 18, "x": 0, "y": 24 },
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "targets": [
+        { "expr": "esp_heap_free_bytes", "legendFormat": "heap_free" },
+        { "expr": "esp_heap_min_free_bytes", "legendFormat": "heap_min_free" },
+        { "expr": "esp_heap_largest_block_bytes", "legendFormat": "heap_largest_block" }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Uptime",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 24 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [{ "expr": "esp_uptime_seconds", "legendFormat": "uptime" }]
+    },
+    {
+      "id": 9,
+      "title": "Coredump present",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 28 },
+      "targets": [{ "expr": "esp_coredump_present", "legendFormat": "coredump" }]
     }
   ],
   "schemaVersion": 39,

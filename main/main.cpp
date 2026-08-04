@@ -4,6 +4,7 @@
 #include "http_server.h"
 #include "mdns_responder.h"
 #include "ota_updater.h"
+#include "system_health.h"
 #include "wifi_connect.h"
 #include "wifi_provision.h"
 
@@ -26,6 +27,7 @@ void log_psram_status()
 
 extern "C" void app_main(void)
 {
+    system_health_report();
     log_psram_status();
     if (wifi_connect_sta()) {
         dns_server_start();

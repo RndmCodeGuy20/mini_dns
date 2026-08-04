@@ -15,12 +15,15 @@
 #include "dns_metrics.h"
 #include "dns_record_store.h"
 #include "esp_app_desc.h"
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 #include "mbedtls/base64.h"
 #include "ota_updater.h"
+#include "system_health.h"
 
 namespace {
 
@@ -556,6 +559,34 @@ void append_simple_metric(std::string &out, const char *name, const char *type,
     out += '\n';
 }
 
+// Same as append_simple_metric(), but with a single label on the sample
+// line (e.g. esp_reset_reason{reason="panic"} 1). A separate function
+// rather than an optional parameter there, since only one caller needs it.
+void append_labeled_metric(std::string &out, const char *name, const char *type,
+                            const char *help, const char *label_key, const char *label_value,
+                            double value)
+{
+    out += "# HELP ";
+    out += name;
+    out += ' ';
+    out += help;
+    out += "\n# TYPE ";
+    out += name;
+    out += ' ';
+    out += type;
+    out += '\n';
+    out += name;
+    out += '{';
+    out += label_key;
+    out += "=\"";
+    out += label_value;
+    out += "\"} ";
+    char value_buf[32];
+    std::snprintf(value_buf, sizeof(value_buf), "%.17g", value);
+    out += value_buf;
+    out += '\n';
+}
+
 // Appends the upstream latency histogram: cumulative bucket counts (as
 // Prometheus histograms require — each bucket includes everything at or
 // below its own "le" bound, up to +Inf), plus _sum and _count.
@@ -632,6 +663,28 @@ esp_err_t metrics_get_handler(httpd_req_t *req)
                           DNS_FORWARDER_MAX_IN_FLIGHT);
     append_simple_metric(out, "dns_blocklist_domains", "gauge",
                           "Domains currently loaded in the ad-block list", bl.size());
+
+    SystemHealth health = system_health_snapshot();
+    append_simple_metric(out, "esp_uptime_seconds", "gauge", "Seconds since boot",
+                          esp_timer_get_time() / 1e6);
+    append_simple_metric(out, "esp_heap_free_bytes", "gauge", "Current free internal heap",
+                          heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    append_simple_metric(out, "esp_heap_min_free_bytes", "gauge",
+                          "Lowest free internal heap seen since boot",
+                          heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+    append_simple_metric(out, "esp_heap_largest_block_bytes", "gauge",
+                          "Largest allocatable internal heap block (fragmentation indicator)",
+                          heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    append_simple_metric(out, "esp_psram_free_bytes", "gauge",
+                          "Current free PSRAM (0 if PSRAM absent/uninitialized)",
+                          heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    append_simple_metric(out, "esp_coredump_present", "gauge",
+                          "1 if a crash dump from a previous boot is stored in flash",
+                          health.coredump_present ? 1 : 0);
+    append_simple_metric(out, "esp_coredump_size_bytes", "gauge", "Stored coredump size",
+                          health.coredump_size);
+    append_labeled_metric(out, "esp_reset_reason", "gauge", "Reason for the most recent boot",
+                           "reason", health.reset_reason_name, 1);
 
     httpd_resp_set_type(req, "text/plain; version=0.0.4");
     return httpd_resp_send(req, out.c_str(), static_cast<ssize_t>(out.size()));

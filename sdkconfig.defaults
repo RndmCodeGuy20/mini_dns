@@ -41,3 +41,23 @@ CONFIG_SECURE_BOOT_SIGNING_KEY="secure_boot_signing_key.pem"
 # GitHub's API and release-asset CDN are both signed by public CAs already
 # in ESP-IDF's bundled root store — no custom CA needed for OTA fetches.
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+
+# Phase 7c: crash dumps to the coredump partition reserved in Phase 7a
+# (see partitions.csv) — previously ENABLE_TO_NONE, so nothing was ever
+# written to it. ELF (not the legacy binary format) so idf.py
+# coredump-info can symbolize it. A dedicated writer stack, rather than
+# borrowing the crashed task's, matters most for the stack-overflow case,
+# where the borrowed stack is exactly what's broken.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_SHA256=y
+CONFIG_ESP_COREDUMP_CHECK_BOOT=y
+CONFIG_ESP_COREDUMP_STACK_SIZE=1792
+
+# Phase 7c: a task-watchdog timeout now panics (→ coredump + reboot)
+# instead of only printing a warning. See dns_server.cpp's
+# esp_task_wdt_add()/esp_task_wdt_reset() and SELECT_MAX_TIMEOUT_MS —
+# the DNS task's select() loop is the only task subscribed, and its
+# timeout was lowered from 5000ms to 2000ms specifically so a healthy
+# idle loop keeps feeding this within CONFIG_ESP_TASK_WDT_TIMEOUT_S (5).
+CONFIG_ESP_TASK_WDT_PANIC=y

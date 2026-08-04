@@ -117,6 +117,16 @@ curl -u admin:<your-password> -X POST http://<esp32-ip>/api/ota/check   # trigge
 
 A newly-flashed or newly-updated image stays in "pending_verify" until it's been up ~30s and answered at least one DNS query, or until 10 minutes have passed regardless of traffic (so an idle-but-healthy device isn't stuck forever) — only then does it cancel the bootloader's rollback, and only then will it accept another OTA check (an attempt while still pending_verify is rejected with 409, matching how `esp_ota_begin()` itself refuses to start an update on an unverified image). If it crashes before the gate passes, the bootloader reverts to the previous image on next reset.
 
+## Reliability & crash forensics (Phase 7c)
+
+A crash (panic or task-watchdog timeout) writes a coredump to the flash partition reserved for it, then reboots. `GET /metrics` exposes `esp_coredump_present` — a 1 there is the signal to go get a cable:
+
+```
+idf.py -p <PORT> coredump-info      # decode and symbolize the stored dump
+```
+
+`/metrics` also carries `esp_reset_reason{reason="..."}` (`poweron`, `sw`, `panic`, `task_wdt`, ...) and heap/PSRAM/uptime gauges for tracking a slow leak or fragmentation over time.
+
 ## Running host tests
 
 The pure DNS wire-format functions (`main/dns_wire.h/.cpp`) have no FreeRTOS/lwIP
@@ -160,4 +170,6 @@ exist as a CI-verified reference build, not a flash-and-go artifact.
 - **OTA updates require a signing key you generate once.** `secure_boot_signing_key.pem` is gitignored like `wifi_credentials.h`; generate it with `espsecure.py generate_signing_key --version 2 --scheme ecdsa256 secure_boot_signing_key.pem` before your first build after Phase 7a — the `--scheme ecdsa256` flag matters, since `espsecure.py` defaults to an RSA key otherwise, which this project's ECDSA-based sdkconfig can't sign with. CI has its own copy in a repository secret (`OTA_SIGNING_KEY_PEM`) — see `.github/workflows/ci.yml`.
 - **Repartitioning (Phase 7a) requires `idf.py erase-flash`.** This wipes the NVS record store, blocklist, and (as of Phase 7b) the stored Wi-Fi config — reflash and re-seed from `dns_records.h`/`dns_blocklist_defaults.h`/`wifi_credentials.h`, or re-provision over the SoftAP portal, after upgrading from a pre-Phase-7a build.
 - **The provisioning portal has no auth, by design.** `/scan`, `/provision`, and the setup page are reachable by anyone who joins `edge-dns-setup` — there's no credential yet to gate them behind at that point, and the AP itself being open is the actual access control. This is fine because provisioning mode never runs at the same time as normal operation (the mutating `/api/records` routes stay Basic-auth-gated as always) — see the SoftAP section above.
+- **A task-watchdog timeout now panics and reboots (Phase 7c), it doesn't just log.** Only the DNS task is subscribed, feeding it once per `select()` wakeup at a 2s interval against a 5s timeout — see ARCHITECTURE.md for the coupling between that interval and the watchdog config if you're touching `dns_server.cpp`'s main loop.
+- **No raw coredump download endpoint, on purpose.** `esp_coredump_present` in `/metrics` tells you a dump exists; pulling the actual bytes is `idf.py coredump-info` over USB, not an HTTP route — it would otherwise expose task-stack contents (potentially including Wi-Fi/admin credentials) over plaintext HTTP.
 - **STA connect failures fall back to the portal without erasing stored credentials.** A router that's merely rebooting recovers on its own next power cycle; only a factory reset (BOOT held ~5s) or a fresh `esp_wifi_set_config` via the portal actually changes what's stored.

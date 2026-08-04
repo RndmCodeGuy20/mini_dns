@@ -13,6 +13,7 @@
 #include "dns_record_store.h"
 #include "dns_wire.h"
 #include "esp_log.h"
+#include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -28,8 +29,11 @@ constexpr size_t TX_BUFFER_SIZE = 512;
 // Upper bound on how long select() blocks with nothing else scheduling
 // a wakeup — also throttles how often the cache gets swept for expired
 // entries (see the main loop). A pending forwarder deadline can still
-// cut this shorter (see next_deadline_ms()).
-constexpr int64_t SELECT_MAX_TIMEOUT_MS = 5000;
+// cut this shorter (see next_deadline_ms()). As of Phase 7c this also
+// sets the task watchdog feed interval (esp_task_wdt_reset() below), so
+// it must stay comfortably under CONFIG_ESP_TASK_WDT_TIMEOUT_S (5s):
+// 5000ms here would have fed the watchdog right at its own deadline.
+constexpr int64_t SELECT_MAX_TIMEOUT_MS = 2000;
 
 int64_t now_ms()
 {
@@ -247,6 +251,11 @@ void handle_client_query(int listen_sock, DnsForwarder &forwarder, DnsCache &cac
 
 void dns_server_task(void *)
 {
+    // The only task subscribed to the TWDT (Phase 7c): a wedge here means
+    // no DNS resolution at all, which is what the watchdog should be
+    // guarding. esp_task_wdt_reset() is fed once per select() wakeup below.
+    esp_task_wdt_add(nullptr);
+
     int listen_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (listen_sock < 0) {
         ESP_LOGE(TAG, "socket() failed: errno %d", errno);
@@ -299,6 +308,7 @@ void dns_server_task(void *)
         tv.tv_usec = static_cast<suseconds_t>((timeout_ms % 1000) * 1000);
 
         int ready = select(max_fd + 1, &read_fds, nullptr, nullptr, &tv);
+        esp_task_wdt_reset();
 
         if (forwarding_enabled) {
             auto reaped = forwarder.reap_expired(now_ms());
