@@ -700,7 +700,9 @@ esp_err_t ota_check_post_handler(httpd_req_t *req)
         // (only through 431) — set the status line directly, same pattern as
         // check_auth()'s 401 above.
         httpd_resp_set_status(req, "409 Conflict");
-        return httpd_resp_send(req, "check already in progress", HTTPD_RESP_USE_STRLEN);
+        return httpd_resp_send(
+            req, "check not allowed right now (already in progress, image still pending_verify, or in failure cooldown)",
+            HTTPD_RESP_USE_STRLEN);
     }
     httpd_resp_set_status(req, "202 Accepted");
     return httpd_resp_send(req, nullptr, 0);

@@ -94,14 +94,14 @@ Grafana dashboard) — see `monitoring/README.md` for setup.
 
 ## OTA updates
 
-The device checks GitHub Releases for a newer tagged version and can update itself over HTTPS (Phase 7a):
+The device checks GitHub Releases for a newer tagged version every 6 hours, and can also be triggered on demand, then updates itself over HTTPS (Phase 7a):
 
 ```
 curl http://<esp32-ip>/api/ota                              # current status
 curl -u admin:<your-password> -X POST http://<esp32-ip>/api/ota/check   # trigger a check now
 ```
 
-A newly-flashed or newly-updated image stays in "pending_verify" until it's been up ~30s and answered at least one DNS query — only then does it cancel the bootloader's rollback. If it crashes before that, the bootloader reverts to the previous image on next reset.
+A newly-flashed or newly-updated image stays in "pending_verify" until it's been up ~30s and answered at least one DNS query, or until 10 minutes have passed regardless of traffic (so an idle-but-healthy device isn't stuck forever) — only then does it cancel the bootloader's rollback, and only then will it accept another OTA check (an attempt while still pending_verify is rejected with 409, matching how `esp_ota_begin()` itself refuses to start an update on an unverified image). If it crashes before the gate passes, the bootloader reverts to the previous image on next reset.
 
 ## Running host tests
 

@@ -181,8 +181,8 @@ void run_check_cycle()
             std::lock_guard<std::mutex> lock(s_last_check_mutex);
             s_last_check = status;
         }
-        s_check_in_progress = false;
         s_last_failure_us = esp_timer_get_time();
+        s_check_in_progress = false;
         ESP_LOGW(TAG, "release check failed: %s", error.c_str());
         return;
     }
@@ -231,8 +231,8 @@ void run_check_cycle()
         std::lock_guard<std::mutex> lock(s_last_check_mutex);
         s_last_check = status;
     }
-    s_check_in_progress = false;
     s_last_failure_us = esp_timer_get_time();
+    s_check_in_progress = false;
 }
 
 void ota_task(void *)

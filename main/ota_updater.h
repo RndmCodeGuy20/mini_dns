@@ -37,6 +37,9 @@ OtaCheckStatus ota_updater_last_check();
 
 // Auth-gated HTTP trigger (POST /api/ota/check in http_server.cpp): asks
 // the background task to run a check-and-update cycle now rather than
-// waiting for its periodic interval. Returns false (no-op) if a cycle is
-// already in progress — the caller should report 409 Conflict.
+// waiting for its periodic interval. Returns false (no-op, caller should
+// report 409 Conflict) if a cycle is already in progress, if the running
+// image hasn't passed its health gate yet (esp_ota_begin() rejects OTA
+// while pending_verify), or if a prior cycle failed within the cooldown
+// window.
 bool ota_updater_request_check();
