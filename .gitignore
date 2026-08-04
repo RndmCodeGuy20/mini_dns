@@ -1,5 +1,6 @@
 main/wifi_credentials.h
 main/admin_credentials.h
+secure_boot_signing_key.pem
 
 build/
 managed_components/

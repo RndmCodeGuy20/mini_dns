@@ -2,7 +2,13 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   firmware-build:
@@ -29,6 +35,24 @@ jobs:
           constexpr const char* ADMIN_USER = "ci-placeholder-admin";
           constexpr const char* ADMIN_PASS = "ci-placeholder-password";
           EOF
+
+      - name: Write OTA signing key
+        env:
+          OTA_SIGNING_KEY_PEM: ${{ secrets.OTA_SIGNING_KEY_PEM }}
+        run: |
+          if [ -z "$OTA_SIGNING_KEY_PEM" ]; then
+            echo "::error::OTA_SIGNING_KEY_PEM secret is empty or unset. Generate a key with" \
+                 "'espsecure.py generate_signing_key --version 2 --scheme ecdsa256 secure_boot_signing_key.pem'" \
+                 "and paste its full contents into the repo's OTA_SIGNING_KEY_PEM secret (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+          echo "$OTA_SIGNING_KEY_PEM" > secure_boot_signing_key.pem
+          if ! grep -q "BEGIN EC PRIVATE KEY" secure_boot_signing_key.pem; then
+            echo "::error::secure_boot_signing_key.pem does not look like an ECDSA key (missing 'BEGIN EC PRIVATE KEY')." \
+                 "Regenerate with --scheme ecdsa256 — this project's sdkconfig expects ECDSA, not the RSA key" \
+                 "espsecure.py generates by default without that flag."
+            exit 1
+          fi
 
       - name: Build firmware
         run: |
@@ -83,6 +107,24 @@ jobs:
           constexpr const char* ADMIN_PASS = "ci-placeholder-password";
           EOF
 
+      - name: Write OTA signing key
+        env:
+          OTA_SIGNING_KEY_PEM: ${{ secrets.OTA_SIGNING_KEY_PEM }}
+        run: |
+          if [ -z "$OTA_SIGNING_KEY_PEM" ]; then
+            echo "::error::OTA_SIGNING_KEY_PEM secret is empty or unset. Generate a key with" \
+                 "'espsecure.py generate_signing_key --version 2 --scheme ecdsa256 secure_boot_signing_key.pem'" \
+                 "and paste its full contents into the repo's OTA_SIGNING_KEY_PEM secret (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+          echo "$OTA_SIGNING_KEY_PEM" > secure_boot_signing_key.pem
+          if ! grep -q "BEGIN EC PRIVATE KEY" secure_boot_signing_key.pem; then
+            echo "::error::secure_boot_signing_key.pem does not look like an ECDSA key (missing 'BEGIN EC PRIVATE KEY')." \
+                 "Regenerate with --scheme ecdsa256 — this project's sdkconfig expects ECDSA, not the RSA key" \
+                 "espsecure.py generates by default without that flag."
+            exit 1
+          fi
+
       - name: Build firmware
         run: |
           . "$IDF_PATH/export.sh"
@@ -96,6 +138,7 @@ jobs:
             build/bootloader/bootloader.bin
             build/partition_table/partition-table.bin
             build/mini_dns.bin
+            build/ota_data_initial.bin
           body: |
             Prebuilt binaries for `${{ github.ref_name }}`.
 
@@ -108,8 +151,16 @@ jobs:
             3. `idf.py set-target esp32s3 && idf.py build`
             4. `idf.py -p <PORT> flash monitor`
 
+            These binaries are signed with this repository's CI signing key. A
+            device will only accept a signed OTA image whose signature matches
+            the public key embedded in its *currently running* firmware —
+            since the Setup instructions above have you generate your own
+            signing key, a locally-built device will reject these CI-signed
+            release assets over OTA. Fresh-flash via the esptool command below
+            works regardless of signing.
+
             Flash command for these prebuilt binaries (placeholder credentials —
             device will boot but will not join your Wi-Fi):
             ```
-            python -m esptool --chip esp32s3 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m 0x0 bootloader.bin 0x8000 partition-table.bin 0x20000 mini_dns.bin
+            python -m esptool --chip esp32s3 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m 0x0 bootloader.bin 0x8000 partition-table.bin 0x19000 ota_data_initial.bin 0x30000 mini_dns.bin
             ```
