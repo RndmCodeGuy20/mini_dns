@@ -102,6 +102,7 @@ jobs:
             build/bootloader/bootloader.bin
             build/partition_table/partition-table.bin
             build/mini_dns.bin
+            build/ota_data_initial.bin
           body: |
             Prebuilt binaries for `${{ github.ref_name }}`.
 
@@ -114,13 +115,16 @@ jobs:
             3. `idf.py set-target esp32s3 && idf.py build`
             4. `idf.py -p <PORT> flash monitor`
 
-            These binaries are signed with this project's CI signing key (Phase
-            7a) — a device already running a signed image will accept an OTA
-            update to this release; a fresh flash via esptool below works
-            regardless of signing.
+            These binaries are signed with this repository's CI signing key. A
+            device will only accept a signed OTA image whose signature matches
+            the public key embedded in its *currently running* firmware —
+            since the Setup instructions above have you generate your own
+            signing key, a locally-built device will reject these CI-signed
+            release assets over OTA. Fresh-flash via the esptool command below
+            works regardless of signing.
 
             Flash command for these prebuilt binaries (placeholder credentials —
             device will boot but will not join your Wi-Fi):
             ```
-            python -m esptool --chip esp32s3 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m 0x0 bootloader.bin 0x8000 partition-table.bin 0x20000 mini_dns.bin
+            python -m esptool --chip esp32s3 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m 0x0 bootloader.bin 0x8000 partition-table.bin 0x19000 ota_data_initial.bin 0x30000 mini_dns.bin
             ```
