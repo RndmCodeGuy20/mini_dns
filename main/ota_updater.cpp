@@ -265,7 +265,13 @@ bool ota_updater_request_check()
     if (s_check_in_progress) {
         return false;
     }
-    if (esp_timer_get_time() - s_last_failure_us < OTA_FAILURE_COOLDOWN_US) {
+    // s_last_failure_us == 0 means "never failed" — esp_timer_get_time()
+    // itself returns values near 0 for roughly the first 30s after boot, so
+    // without this guard the very first legitimate check request after
+    // flashing/booting would be spuriously rejected as "within cooldown"
+    // even though nothing has ever failed.
+    if (s_last_failure_us != 0 &&
+        esp_timer_get_time() - s_last_failure_us < OTA_FAILURE_COOLDOWN_US) {
         return false;
     }
     s_check_requested = true;

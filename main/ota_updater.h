@@ -23,10 +23,13 @@ struct OtaCheckStatus {
     bool checked = false;         // false until the first check cycle has run
     bool in_progress = false;     // a check-and-update cycle is currently running
     bool update_available = false;
-    // Most recent tag this device successfully parsed from GitHub, if any.
+    // The tag parsed during the most recent check cycle, if that cycle got
+    // that far — run_check_cycle() starts from a fresh, empty OtaCheckStatus
+    // every cycle, so this is NOT "the most recent tag ever parsed": a
+    // network/HTTP/JSON-shape failure that happens before the tag_name parse
+    // step clears it back to empty, even if a prior cycle had populated it.
     // May be populated even when last_error is non-empty — e.g. the release
-    // parsed fine but had no mini_dns.bin asset. Stays empty only if no
-    // release's tag_name has ever been read successfully.
+    // parsed fine but had no mini_dns.bin asset.
     std::string latest_version;
     std::string last_error;       // empty on success
 };
