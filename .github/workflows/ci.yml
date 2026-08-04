@@ -30,6 +30,9 @@ jobs:
           constexpr const char* ADMIN_PASS = "ci-placeholder-password";
           EOF
 
+      - name: Write OTA signing key
+        run: echo "${{ secrets.OTA_SIGNING_KEY_PEM }}" > secure_boot_signing_key.pem
+
       - name: Build firmware
         run: |
           . "$IDF_PATH/export.sh"
@@ -83,6 +86,9 @@ jobs:
           constexpr const char* ADMIN_PASS = "ci-placeholder-password";
           EOF
 
+      - name: Write OTA signing key
+        run: echo "${{ secrets.OTA_SIGNING_KEY_PEM }}" > secure_boot_signing_key.pem
+
       - name: Build firmware
         run: |
           . "$IDF_PATH/export.sh"
@@ -107,6 +113,11 @@ jobs:
                your real values (see README.md's Setup section)
             3. `idf.py set-target esp32s3 && idf.py build`
             4. `idf.py -p <PORT> flash monitor`
+
+            These binaries are signed with this project's CI signing key (Phase
+            7a) — a device already running a signed image will accept an OTA
+            update to this release; a fresh flash via esptool below works
+            regardless of signing.
 
             Flash command for these prebuilt binaries (placeholder credentials —
             device will boot but will not join your Wi-Fi):
