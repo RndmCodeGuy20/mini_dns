@@ -86,6 +86,23 @@ dig @<esp32-ip> AAAA dual.loc          # answered locally, not forwarded
 dig @<esp32-ip> AAAA foo.loc           # v4-only record: NOERROR, no answer (NODATA) — not NXDOMAIN
 ```
 
+## Monitoring
+
+A Prometheus + Grafana stack for the `/metrics` endpoint lives in
+[`monitoring/`](monitoring/) (docker-compose, scrape config, provisioned
+Grafana dashboard) — see `monitoring/README.md` for setup.
+
+## OTA updates
+
+The device checks GitHub Releases for a newer tagged version and can update itself over HTTPS (Phase 7a):
+
+```
+curl http://<esp32-ip>/api/ota                              # current status
+curl -u admin:<your-password> -X POST http://<esp32-ip>/api/ota/check   # trigger a check now
+```
+
+A newly-flashed or newly-updated image stays in "pending_verify" until it's been up ~30s and answered at least one DNS query — only then does it cancel the bootloader's rollback. If it crashes before that, the bootloader reverts to the previous image on next reset.
+
 ## Running host tests
 
 The pure DNS wire-format functions (`main/dns_wire.h/.cpp`) have no FreeRTOS/lwIP
@@ -126,3 +143,5 @@ exist as a CI-verified reference build, not a flash-and-go artifact.
 - **Metrics run for the life of the device.** `/metrics` counters reset only on reboot — there's no zero/reset endpoint.
 - **Basic auth runs over plaintext HTTP.** There's no TLS on this device, so credentials for the mutating `/api/records` routes are base64-encoded, not encrypted. Fine on a trusted LAN, not a real security boundary.
 - **CORS is effectively open.** The mutating routes reflect back whatever `Origin` a request sends (browsers disallow a wildcard alongside credentialed requests) — protection comes entirely from the Basic-auth check, not from origin filtering.
+- **OTA updates require a signing key you generate once.** `secure_boot_signing_key.pem` is gitignored like `wifi_credentials.h`; generate it with `espsecure.py generate_signing_key --version 2 secure_boot_signing_key.pem` before your first build after Phase 7a. CI has its own copy in a repository secret — see `.github/workflows/ci.yml`.
+- **Repartitioning (Phase 7a) requires `idf.py erase-flash`.** This wipes the NVS record store and blocklist — reflash and re-seed from `dns_records.h`/`dns_blocklist_defaults.h`, or re-add records via the CRUD API, after upgrading from a pre-Phase-7a build.
