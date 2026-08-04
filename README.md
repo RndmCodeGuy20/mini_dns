@@ -2,7 +2,7 @@
 
 A minimal ESP32-S3 firmware that connects to Wi-Fi, resolves a runtime-managed set of hostnames over DNS (UDP/53), forwards everything else to an upstream resolver with TTL caching, sinkholes ad/tracker domains, advertises itself via mDNS, and serves an HTTP page + a JSON CRUD API + Prometheus metrics.
 
-Proof-of-concept moving toward a marketable "edge DNS" appliance — no TLS. Records are NVS-persisted and editable via a Basic-auth-gated CRUD API, dual-stack (A+AAAA), self-updating over signed OTA, and self-provisioning over a SoftAP captive portal (see below) — with a secondary-upstream retry on forward timeout and a host-side Unity test suite for the wire-format and validation layers. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for design details, gotchas, and future scoping — including which phase shipped what, if you're curious about the build order.
+A marketable "edge DNS" appliance — no TLS. Records are NVS-persisted and editable via a Basic-auth-gated CRUD API, dual-stack (A+AAAA), self-updating over signed OTA, and self-provisioning over a SoftAP captive portal (see below) — with a secondary-upstream retry on forward timeout and a host-side Unity test suite for the wire-format and validation layers. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for design details, gotchas, and future scoping — including which phase shipped what, if you're curious about the build order.
 
 ## Prerequisites
 
