@@ -2,7 +2,7 @@
 
 A minimal ESP32-S3 firmware that connects to Wi-Fi, resolves a runtime-managed set of hostnames over DNS (UDP/53), forwards everything else to an upstream resolver with TTL caching, sinkholes ad/tracker domains, advertises itself via mDNS, and serves an HTTP page + a JSON CRUD API + Prometheus metrics.
 
-Proof-of-concept moving toward a marketable "edge DNS" appliance — no TLS. Records are NVS-persisted and editable via a Basic-auth-gated CRUD API as of Phase 5, dual-stack (A+AAAA) as of Phase 6, self-updating over signed OTA as of Phase 7a, and self-provisioning over a SoftAP captive portal as of Phase 7b (see below) — with a secondary-upstream retry on forward timeout and a host-side Unity test suite for the wire-format and validation layers. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for design details, gotchas, and future scoping.
+Proof-of-concept moving toward a marketable "edge DNS" appliance — no TLS. Records are NVS-persisted and editable via a Basic-auth-gated CRUD API, dual-stack (A+AAAA), self-updating over signed OTA, and self-provisioning over a SoftAP captive portal (see below) — with a secondary-upstream retry on forward timeout and a host-side Unity test suite for the wire-format and validation layers. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for design details, gotchas, and future scoping — including which phase shipped what, if you're curious about the build order.
 
 ## Prerequisites
 
@@ -18,28 +18,28 @@ Proof-of-concept moving toward a marketable "edge DNS" appliance — no TLS. Rec
    cd mini_dns
    ```
 
-2. **Create `main/wifi_credentials.h`** — gitignored, does not exist on a fresh clone, and still required for the build to compile (`wifi_connect.cpp` includes it unconditionally). As of Phase 7b, though, the values in it only matter as a **first-boot seed**: the device persists its actual Wi-Fi config in esp_wifi's own NVS storage, so after the first successful connect this header is never consulted again. If you'd rather not put real credentials in a file at all, placeholder values are fine — the seed just won't connect, the device falls back to its SoftAP portal after 30s, and you provision it from there instead. See [Wi-Fi provisioning](#wi-fi-provisioning-phase-7b) below.
+2. **Create `main/wifi_credentials.h`** — gitignored, does not exist on a fresh clone, and still required for the build to compile (`wifi_connect.cpp` includes it unconditionally). The values in it only matter as a **first-boot seed**: the device persists its actual Wi-Fi config in esp_wifi's own NVS storage, so after the first successful connect this header is never consulted again. If you'd rather not put real credentials in a file at all, placeholder values are fine — the seed just won't connect, the device falls back to its SoftAP portal after 30s, and you provision it from there instead. See [Wi-Fi provisioning](#wi-fi-provisioning) below.
    ```cpp
    #pragma once
    constexpr const char* WIFI_SSID = "your-ssid";
    constexpr const char* WIFI_PASSWORD = "your-password";
    ```
 
-3. **Create `main/admin_credentials.h`** — gitignored, same pattern as above. This is the Basic-auth credential checked on the mutating `POST`/`PUT`/`DELETE /api/records` routes (Phase 5):
+3. **Create `main/admin_credentials.h`** — gitignored, same pattern as above. This is the Basic-auth credential checked on the mutating `POST`/`PUT`/`DELETE /api/records` routes:
    ```cpp
    #pragma once
    constexpr const char* ADMIN_USER = "admin";
    constexpr const char* ADMIN_PASS = "your-password";
    ```
 
-4. **Edit `main/dns_records.h`** with your own hostname → IPv4 mappings. As of Phase 5 this is only the **first-boot seed** — `DNS_RECORDS_DEFAULTS` is loaded into NVS once, then the live table lives there and is managed via the CRUD API below, not by reflashing:
+4. **Edit `main/dns_records.h`** with your own hostname → IPv4 mappings. This is only the **first-boot seed** — `DNS_RECORDS_DEFAULTS` is loaded into NVS once, then the live table lives there and is managed via the CRUD API below, not by reflashing:
    ```cpp
    constexpr std::array<dns_record_t, N> DNS_RECORDS_DEFAULTS = {{
        {"myhost.loc", {192, 168, 1, 100}},
        // ...
    }};
    ```
-   Avoid the `.local` TLD for anything you intend to reach from a phone/laptop browser — see the mDNS gotcha below. (The device itself is always reachable at `edge-dns.local` regardless of what TLD your records use — see Phase 4.) This seed table is IPv4-only; an AAAA address for a seeded name can be added afterward through the CRUD API (Phase 6, below) once the device has booted.
+   Avoid the `.local` TLD for anything you intend to reach from a phone/laptop browser — see the mDNS gotcha below. (The device itself is always reachable at `edge-dns.local` regardless of what TLD your records use.) This seed table is IPv4-only; an AAAA address for a seeded name can be added afterward through the CRUD API below once the device has booted.
 
 ## Building and flashing
 
@@ -56,7 +56,7 @@ Finding `<PORT>`:
 
 On boot you should see log lines for Wi-Fi connecting (with the assigned IP), the DNS server binding to port 53, and the HTTP server starting on port 80. If no network is reachable within 30s, the device instead logs that it's starting the provisioning portal — see below. Exit the serial monitor with `Ctrl+]`.
 
-## Wi-Fi provisioning (Phase 7b)
+## Wi-Fi provisioning
 
 If the device has no working Wi-Fi config — first boot with a bad/placeholder seed, a router that's down, or after a factory reset — it comes up as its own open access point instead of retrying forever:
 
@@ -81,7 +81,7 @@ curl http://<esp32-ip>/api/blocklist  # JSON blocklist status + running block co
 curl http://<esp32-ip>/metrics        # Prometheus plaintext metrics
 curl http://edge-dns.local/           # same dashboard, resolved via mDNS instead of raw IP
 
-# Record management (Phase 5) — POST/PUT/DELETE require Basic auth
+# Record management — POST/PUT/DELETE require Basic auth
 curl -u admin:<your-password> -X POST -d '{"host":"foo.loc","ip":"192.168.1.99"}' \
   http://<esp32-ip>/api/records
 curl -u admin:<your-password> -X PUT -d '{"host":"foo.loc","ip":"192.168.1.100"}' \
@@ -89,7 +89,7 @@ curl -u admin:<your-password> -X PUT -d '{"host":"foo.loc","ip":"192.168.1.100"}
 curl -u admin:<your-password> -X DELETE -d '{"host":"foo.loc"}' \
   http://<esp32-ip>/api/records
 
-# Dual-stack records (Phase 6) — "ip" and "ipv6" are each optional, but a
+# Dual-stack records — "ip" and "ipv6" are each optional, but a
 # create/update needs at least one; either or both together are fine
 curl -u admin:<your-password> -X POST \
   -d '{"host":"dual.loc","ip":"192.168.1.99","ipv6":"2001:db8::1"}' \
@@ -108,7 +108,7 @@ Grafana dashboard) — see `monitoring/README.md` for setup.
 
 ## OTA updates
 
-The device checks GitHub Releases for a newer tagged version every 6 hours, and can also be triggered on demand, then updates itself over HTTPS (Phase 7a):
+The device checks GitHub Releases for a newer tagged version every 6 hours, and can also be triggered on demand, then updates itself over HTTPS:
 
 ```
 curl http://<esp32-ip>/api/ota                              # current status
@@ -117,7 +117,7 @@ curl -u admin:<your-password> -X POST http://<esp32-ip>/api/ota/check   # trigge
 
 A newly-flashed or newly-updated image stays in "pending_verify" until it's been up ~30s and answered at least one DNS query, or until 10 minutes have passed regardless of traffic (so an idle-but-healthy device isn't stuck forever) — only then does it cancel the bootloader's rollback, and only then will it accept another OTA check (an attempt while still pending_verify is rejected with 409, matching how `esp_ota_begin()` itself refuses to start an update on an unverified image). If it crashes before the gate passes, the bootloader reverts to the previous image on next reset.
 
-## Reliability & crash forensics (Phase 7c)
+## Reliability & crash forensics
 
 A crash (panic or task-watchdog timeout) writes a coredump to the flash partition reserved for it, then reboots. `GET /metrics` exposes `esp_coredump_present` — a 1 there is the signal to go get a cable:
 
@@ -131,7 +131,7 @@ idf.py -p <PORT> coredump-info      # decode and symbolize the stored dump
 
 The pure DNS wire-format functions (`main/dns_wire.h/.cpp`) have no FreeRTOS/lwIP
 dependency, so they're covered by a Unity test suite that builds and runs on the
-host — no board, no QEMU (Phase 6):
+host — no board, no QEMU:
 
 ```
 source $IDF_PATH/export.sh
@@ -160,16 +160,19 @@ Setup above). Anyone deploying to a real device still needs to create those two
 files locally and rebuild, exactly as in Setup steps 2–3; the release binaries
 exist as a CI-verified reference build, not a flash-and-go artifact.
 
-## Known gotchas (see ARCHITECTURE.md for full detail)
+## Known gotchas
 
-- **`.local` hostnames won't resolve from a phone/laptop browser.** `.local` is reserved for mDNS (RFC 6762); client OS resolvers intercept it before it ever reaches this device's DNS server. `dig`/`nslookup` work fine since they bypass that OS-level special-casing. Use a different TLD (e.g. `.loc`, `.test`) for anything you need a real browser to resolve. The device itself is always reachable at `edge-dns.local` via a real mDNS responder (Phase 4) — that's a separate mechanism from your own records.
-- **Forwarding, not true recursion.** Anything not in the record store or the ad-block list is forwarded to an upstream resolver (`1.1.1.1` by default) and cached — not resolved by walking the root servers. As of Phase 6, a timed-out query is retried once against a secondary (`1.0.0.1`) before giving up; only if both time out does the client get SERVFAIL (after up to ~4s total).
-- **Metrics run for the life of the device.** `/metrics` counters reset only on reboot — there's no zero/reset endpoint.
-- **Basic auth runs over plaintext HTTP.** There's no TLS on this device, so credentials for the mutating `/api/records` routes are base64-encoded, not encrypted. Fine on a trusted LAN, not a real security boundary.
-- **CORS is effectively open.** The mutating routes reflect back whatever `Origin` a request sends (browsers disallow a wildcard alongside credentialed requests) — protection comes entirely from the Basic-auth check, not from origin filtering.
-- **OTA updates require a signing key you generate once.** `secure_boot_signing_key.pem` is gitignored like `wifi_credentials.h`; generate it with `espsecure.py generate_signing_key --version 2 --scheme ecdsa256 secure_boot_signing_key.pem` before your first build after Phase 7a — the `--scheme ecdsa256` flag matters, since `espsecure.py` defaults to an RSA key otherwise, which this project's ECDSA-based sdkconfig can't sign with. CI has its own copy in a repository secret (`OTA_SIGNING_KEY_PEM`) — see `.github/workflows/ci.yml`.
-- **Repartitioning (Phase 7a) requires `idf.py erase-flash`.** This wipes the NVS record store, blocklist, and (as of Phase 7b) the stored Wi-Fi config — reflash and re-seed from `dns_records.h`/`dns_blocklist_defaults.h`/`wifi_credentials.h`, or re-provision over the SoftAP portal, after upgrading from a pre-Phase-7a build.
-- **The provisioning portal has no auth, by design.** `/scan`, `/provision`, and the setup page are reachable by anyone who joins `edge-dns-setup` — there's no credential yet to gate them behind at that point, and the AP itself being open is the actual access control. This is fine because provisioning mode never runs at the same time as normal operation (the mutating `/api/records` routes stay Basic-auth-gated as always) — see the SoftAP section above.
-- **A task-watchdog timeout now panics and reboots (Phase 7c), it doesn't just log.** Only the DNS task is subscribed, feeding it once per `select()` wakeup at a 2s interval against a 5s timeout — see ARCHITECTURE.md for the coupling between that interval and the watchdog config if you're touching `dns_server.cpp`'s main loop.
-- **No raw coredump download endpoint, on purpose.** `esp_coredump_present` in `/metrics` tells you a dump exists; pulling the actual bytes is `idf.py coredump-info` over USB, not an HTTP route — it would otherwise expose task-stack contents (potentially including Wi-Fi/admin credentials) over plaintext HTTP.
-- **STA connect failures fall back to the portal without erasing stored credentials.** A router that's merely rebooting recovers on its own next power cycle; only a factory reset (BOOT held ~5s) or a fresh `esp_wifi_set_config` via the portal actually changes what's stored.
+Full reasoning for each of these lives in `ARCHITECTURE.md`'s Gotchas section — this list is just enough to know they exist:
+
+- `.local` hostnames won't resolve from a phone/laptop browser (mDNS claims that TLD first); use `.loc`/`.test` etc. for your own records. `edge-dns.local` (the device itself) still works via the mDNS responder.
+- Unmatched queries are forwarded and cached, not recursively resolved — a primary-upstream timeout gets one retry against a secondary before SERVFAIL.
+- `/metrics` counters only reset on reboot; there's no zero/reset endpoint.
+- Basic auth on the mutating `/api/records` routes runs over plaintext HTTP — fine on a trusted LAN, not a real security boundary. Same for CORS: it reflects whatever `Origin` a request sends, so Basic auth is the only real gate.
+- The Wi-Fi provisioning portal (`/scan`, `/provision`, setup page) carries no auth — the AP being open is the access control, and it never runs concurrently with normal operation.
+- A task-watchdog timeout now panics and reboots (writing a coredump) instead of only logging; only the DNS task is subscribed. There's no raw coredump download endpoint — `esp_coredump_present` in `/metrics` just tells you to go pull one with `idf.py coredump-info` over USB.
+- A failed STA connect falls back to the portal without erasing stored Wi-Fi credentials — a router that's merely rebooting recovers on its own; only a factory reset or a fresh submission through the portal changes what's stored.
+
+Two operational notes worth calling out here specifically, since they're setup steps rather than design tradeoffs:
+
+- **OTA updates require a signing key you generate once.** `secure_boot_signing_key.pem` is gitignored like `wifi_credentials.h`; generate it with `espsecure.py generate_signing_key --version 2 --scheme ecdsa256 secure_boot_signing_key.pem` before your first build — the `--scheme ecdsa256` flag matters, since `espsecure.py` defaults to an RSA key otherwise, which this project's ECDSA-based sdkconfig can't sign with. CI has its own copy in a repository secret (`OTA_SIGNING_KEY_PEM`) — see `.github/workflows/ci.yml`.
+- **Repartitioning requires `idf.py erase-flash`.** This wipes the NVS record store, blocklist, and stored Wi-Fi config — reflash and re-seed from `dns_records.h`/`dns_blocklist_defaults.h`/`wifi_credentials.h`, or re-provision over the SoftAP portal, after any partition-table change.
