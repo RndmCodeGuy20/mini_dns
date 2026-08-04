@@ -92,6 +92,8 @@ A Prometheus + Grafana stack for the `/metrics` endpoint lives in
 [`monitoring/`](monitoring/) (docker-compose, scrape config, provisioned
 Grafana dashboard) — see `monitoring/README.md` for setup.
 
+![Grafana dashboard showing query breakdown, upstream health, latency percentiles, and saturation](docs/grafana-dashboard.png)
+
 ## OTA updates
 
 The device checks GitHub Releases for a newer tagged version every 6 hours, and can also be triggered on demand, then updates itself over HTTPS (Phase 7a):

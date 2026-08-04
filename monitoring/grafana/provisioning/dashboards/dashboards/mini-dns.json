@@ -1,0 +1,95 @@
+{
+  "title": "mini_dns",
+  "uid": "mini-dns",
+  "timezone": "browser",
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Query breakdown (rate/5m)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "rate(dns_queries_total[5m])", "legendFormat": "queries" },
+        { "expr": "rate(dns_local_hits_total[5m])", "legendFormat": "local_hits" },
+        { "expr": "rate(dns_cache_hits_total[5m])", "legendFormat": "cache_hits" },
+        { "expr": "rate(dns_cache_misses_total[5m])", "legendFormat": "cache_misses" },
+        { "expr": "rate(dns_forwarded_total[5m])", "legendFormat": "forwarded" },
+        { "expr": "rate(dns_blocked_total[5m])", "legendFormat": "blocked" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Upstream health (rate/5m)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "rate(dns_upstream_replies_total[5m])", "legendFormat": "replies" },
+        { "expr": "rate(dns_upstream_timeouts_total[5m])", "legendFormat": "timeouts" },
+        { "expr": "rate(dns_upstream_retries_total[5m])", "legendFormat": "retries" },
+        { "expr": "rate(dns_servfail_total[5m])", "legendFormat": "servfail" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Upstream latency (p50/p95/p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(dns_upstream_latency_ms_bucket[5m]))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(dns_upstream_latency_ms_bucket[5m]))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(dns_upstream_latency_ms_bucket[5m]))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Saturation",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "dns_cache_entries / dns_cache_capacity",
+          "legendFormat": "cache"
+        },
+        {
+          "expr": "dns_inflight_queries / dns_inflight_capacity",
+          "legendFormat": "inflight"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Blocklist domains",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 16 },
+      "targets": [{ "expr": "dns_blocklist_domains", "legendFormat": "domains" }]
+    },
+    {
+      "id": 6,
+      "title": "Upstream timeout rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 18, "x": 6, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "rate(dns_upstream_timeouts_total[5m]) / rate(dns_forwarded_total[5m])",
+          "legendFormat": "timeout rate"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 2
+}
