@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <mutex>
 
 #include "cJSON.h"
 #include "dns_metrics.h"
@@ -23,7 +24,7 @@ constexpr const char *TAG = "ota_updater";
 // GitHub requires a User-Agent on every API request or it 403s — the repo
 // name doubles as a plausible one. No auth token: this hits the
 // unauthenticated rate limit (60 req/hr per IP), which a device checking
-// every few hours never approaches.
+// every OTA_CHECK_INTERVAL_US (6h) never approaches.
 constexpr const char *GITHUB_RELEASES_URL =
     "https://api.github.com/repos/RndmCodeGuy20/mini_dns/releases/latest";
 constexpr const char *USER_AGENT = "mini_dns-ota-updater";
@@ -34,6 +35,17 @@ constexpr const char *USER_AGENT = "mini_dns-ota-updater";
 // rule out a crash-loop that only manifests once traffic arrives; short
 // enough that a healthy device doesn't sit "pending verify" for long.
 constexpr int64_t HEALTH_GATE_MIN_UPTIME_US = 30LL * 1000 * 1000;
+
+// Absolute-time escape from the query-count requirement above: an idle
+// device (no DNS traffic yet) that has nonetheless run this long without
+// crashing is trusted even with zero queries — the alternative is an
+// unrecoverable rollback of a genuinely healthy image just because nothing
+// happened to query it yet.
+constexpr int64_t HEALTH_GATE_MAX_UPTIME_US = 10LL * 60 * 1000 * 1000;
+
+// How often the background task polls GitHub Releases on its own, absent
+// a manual POST /api/ota/check — matches the rate-limit comment above.
+constexpr int64_t OTA_CHECK_INTERVAL_US = 6LL * 3600 * 1000 * 1000;
 
 // A failed check (rate-limited, DNS broken, no asset, etc.) is usually not
 // transient on a device-restart timescale — without a cooldown, a naive
@@ -57,12 +69,14 @@ std::atomic<bool> s_check_in_progress{false};
 // gates ota_updater_request_check() during the cooldown window.
 std::atomic<int64_t> s_last_failure_us{0};
 
-// Written only by the background task; read via ota_updater_last_check().
-// A single mutex-free struct copy is acceptable here for the same reason
-// DnsMetricsSnapshot's per-field reads are (see dns_metrics.h) — this is a
-// low-frequency status readout, not a hot path, and a torn read at worst
-// shows a status one field out of date for one HTTP request.
+// Written only by the background task, read via ota_updater_last_check()
+// from the HTTP task. Guarded by s_last_check_mutex — unlike
+// DnsMetricsSnapshot's plain fields, OtaCheckStatus holds std::string
+// members, and a copy-assignment racing a concurrent read can free the
+// source string's heap buffer mid-copy (use-after-free), not just return a
+// stale value.
 OtaCheckStatus s_last_check;
+std::mutex s_last_check_mutex;
 
 struct HttpResponseBuffer {
     std::string data;
@@ -163,7 +177,10 @@ void run_check_cycle()
         // "never checked".
         status.latest_version = tag;
         status.last_error = error;
-        s_last_check = status;
+        {
+            std::lock_guard<std::mutex> lock(s_last_check_mutex);
+            s_last_check = status;
+        }
         s_check_in_progress = false;
         s_last_failure_us = esp_timer_get_time();
         ESP_LOGW(TAG, "release check failed: %s", error.c_str());
@@ -177,7 +194,10 @@ void run_check_cycle()
     if (!status.update_available) {
         ESP_LOGI(TAG, "running %s, latest is %s — no update", current_version.c_str(),
                  tag.c_str());
-        s_last_check = status;
+        {
+            std::lock_guard<std::mutex> lock(s_last_check_mutex);
+            s_last_check = status;
+        }
         s_check_in_progress = false;
         return;
     }
@@ -197,14 +217,20 @@ void run_check_cycle()
     esp_err_t err = esp_https_ota(&ota_config);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "OTA succeeded, rebooting into %s", tag.c_str());
-        s_last_check = status;
+        {
+            std::lock_guard<std::mutex> lock(s_last_check_mutex);
+            s_last_check = status;
+        }
         s_check_in_progress = false;
         esp_restart();
     }
 
     status.last_error = std::string("esp_https_ota failed: ") + esp_err_to_name(err);
     ESP_LOGE(TAG, "%s", status.last_error.c_str());
-    s_last_check = status;
+    {
+        std::lock_guard<std::mutex> lock(s_last_check_mutex);
+        s_last_check = status;
+    }
     s_check_in_progress = false;
     s_last_failure_us = esp_timer_get_time();
 }
@@ -212,12 +238,18 @@ void run_check_cycle()
 void ota_task(void *)
 {
     const int64_t boot_time_us = esp_timer_get_time();
+    int64_t last_periodic_check_us = boot_time_us;
     bool health_gate_passed = false;
 
     while (true) {
         if (!health_gate_passed) {
             int64_t uptime_us = esp_timer_get_time() - boot_time_us;
-            if (uptime_us >= HEALTH_GATE_MIN_UPTIME_US && metrics().snapshot().queries >= 1) {
+            // Queries >= 1 is the normal path; the absolute-time fallback
+            // (uptime past HEALTH_GATE_MAX_UPTIME_US) covers a healthy but
+            // idle device that would otherwise never leave pending_verify
+            // and get rolled back on its next reset despite being fine.
+            if (uptime_us >= HEALTH_GATE_MIN_UPTIME_US &&
+                (metrics().snapshot().queries >= 1 || uptime_us >= HEALTH_GATE_MAX_UPTIME_US)) {
                 esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
                 if (err == ESP_OK) {
                     s_valid_marked = true;
@@ -231,6 +263,10 @@ void ota_task(void *)
         }
 
         if (s_check_requested.exchange(false)) {
+            run_check_cycle();
+        } else if (health_gate_passed &&
+                   esp_timer_get_time() - last_periodic_check_us >= OTA_CHECK_INTERVAL_US) {
+            last_periodic_check_us = esp_timer_get_time();
             run_check_cycle();
         }
 
@@ -255,7 +291,11 @@ OtaCheckStatus ota_updater_last_check()
     // in_progress lives in its own atomic (s_check_in_progress), not inside
     // s_last_check, since it changes independently of a completed check's
     // result — stitched in here rather than stored redundantly in two places.
-    OtaCheckStatus status = s_last_check;
+    OtaCheckStatus status;
+    {
+        std::lock_guard<std::mutex> lock(s_last_check_mutex);
+        status = s_last_check;
+    }
     status.in_progress = s_check_in_progress;
     return status;
 }
@@ -263,6 +303,12 @@ OtaCheckStatus ota_updater_last_check()
 bool ota_updater_request_check()
 {
     if (s_check_in_progress) {
+        return false;
+    }
+    if (!s_valid_marked) {
+        // esp_ota_begin() rejects a new OTA attempt while the running image
+        // is still pending_verify (ESP_ERR_OTA_ROLLBACK_INVALID_STATE) — fail
+        // fast instead of letting a doomed attempt trip the failure cooldown.
         return false;
     }
     // s_last_failure_us == 0 means "never failed" — esp_timer_get_time()
