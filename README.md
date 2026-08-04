@@ -2,7 +2,7 @@
 
 A minimal ESP32-S3 firmware that connects to Wi-Fi, resolves a runtime-managed set of hostnames over DNS (UDP/53), forwards everything else to an upstream resolver with TTL caching, sinkholes ad/tracker domains, advertises itself via mDNS, and serves an HTTP page + a JSON CRUD API + Prometheus metrics.
 
-Proof-of-concept moving toward a marketable "edge DNS" appliance — no provisioning UI, no OTA, no TLS. Records are NVS-persisted and editable via a Basic-auth-gated CRUD API as of Phase 5, dual-stack (A+AAAA) as of Phase 6, with a secondary-upstream retry on forward timeout and a host-side Unity test suite for the wire-format layer (see below). See [`ARCHITECTURE.md`](ARCHITECTURE.md) for design details, gotchas, and future scoping.
+Proof-of-concept moving toward a marketable "edge DNS" appliance — no TLS. Records are NVS-persisted and editable via a Basic-auth-gated CRUD API as of Phase 5, dual-stack (A+AAAA) as of Phase 6, self-updating over signed OTA as of Phase 7a, and self-provisioning over a SoftAP captive portal as of Phase 7b (see below) — with a secondary-upstream retry on forward timeout and a host-side Unity test suite for the wire-format and validation layers. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for design details, gotchas, and future scoping.
 
 ## Prerequisites
 
@@ -18,7 +18,7 @@ Proof-of-concept moving toward a marketable "edge DNS" appliance — no provisio
    cd mini_dns
    ```
 
-2. **Create `main/wifi_credentials.h`** — this file is gitignored (it holds real Wi-Fi credentials) and does not exist on a fresh clone. Create it with your own values:
+2. **Create `main/wifi_credentials.h`** — gitignored, does not exist on a fresh clone, and still required for the build to compile (`wifi_connect.cpp` includes it unconditionally). As of Phase 7b, though, the values in it only matter as a **first-boot seed**: the device persists its actual Wi-Fi config in esp_wifi's own NVS storage, so after the first successful connect this header is never consulted again. If you'd rather not put real credentials in a file at all, placeholder values are fine — the seed just won't connect, the device falls back to its SoftAP portal after 30s, and you provision it from there instead. See [Wi-Fi provisioning](#wi-fi-provisioning-phase-7b) below.
    ```cpp
    #pragma once
    constexpr const char* WIFI_SSID = "your-ssid";
@@ -54,7 +54,19 @@ Finding `<PORT>`:
 - macOS: `ls /dev/tty.usbserial-* /dev/tty.usbmodem*`
 - Linux: usually `/dev/ttyUSB0` or `/dev/ttyACM0`
 
-On boot you should see log lines for Wi-Fi connecting (with the assigned IP), the DNS server binding to port 53, and the HTTP server starting on port 80. Exit the serial monitor with `Ctrl+]`.
+On boot you should see log lines for Wi-Fi connecting (with the assigned IP), the DNS server binding to port 53, and the HTTP server starting on port 80. If no network is reachable within 30s, the device instead logs that it's starting the provisioning portal — see below. Exit the serial monitor with `Ctrl+]`.
+
+## Wi-Fi provisioning (Phase 7b)
+
+If the device has no working Wi-Fi config — first boot with a bad/placeholder seed, a router that's down, or after a factory reset — it comes up as its own open access point instead of retrying forever:
+
+1. Join **`edge-dns-setup`** from a phone or laptop (no password). Most OSes pop the captive-portal page automatically; if not, browse to any address — the device answers every DNS query with its own IP (`192.168.4.1` by default) and every HTTP path with the setup form.
+2. Pick a network from the scanned list (or type an SSID manually) and enter its password, then submit.
+3. The device saves the config, reboots, and joins that network in station mode as usual.
+
+**Factory reset:** hold the board's **BOOT** button (GPIO0) for about 5 seconds. This wipes the stored Wi-Fi config and reboots straight back into the provisioning portal — the recovery path if you provisioned the wrong password and don't have a cable handy.
+
+The provisioning portal (`/scan`, `/provision`, and the form itself) is intentionally unauthenticated: the AP is open by definition, and there's no credential yet to gate it behind — anyone close enough to join `edge-dns-setup` already has the same access a cable would give them.
 
 ## Testing
 
@@ -117,7 +129,7 @@ idf.py --preview set-target linux -C host_test build
 ./host_test/build/host_test.elf
 ```
 
-Exits 0 with `24 Tests 0 Failures` on success — a nonzero exit is Unity's failure
+Exits 0 with `47 Tests 0 Failures` on success — a nonzero exit is Unity's failure
 count, so this is CI-friendly as-is.
 
 ## Continuous Integration
@@ -146,4 +158,6 @@ exist as a CI-verified reference build, not a flash-and-go artifact.
 - **Basic auth runs over plaintext HTTP.** There's no TLS on this device, so credentials for the mutating `/api/records` routes are base64-encoded, not encrypted. Fine on a trusted LAN, not a real security boundary.
 - **CORS is effectively open.** The mutating routes reflect back whatever `Origin` a request sends (browsers disallow a wildcard alongside credentialed requests) — protection comes entirely from the Basic-auth check, not from origin filtering.
 - **OTA updates require a signing key you generate once.** `secure_boot_signing_key.pem` is gitignored like `wifi_credentials.h`; generate it with `espsecure.py generate_signing_key --version 2 --scheme ecdsa256 secure_boot_signing_key.pem` before your first build after Phase 7a — the `--scheme ecdsa256` flag matters, since `espsecure.py` defaults to an RSA key otherwise, which this project's ECDSA-based sdkconfig can't sign with. CI has its own copy in a repository secret (`OTA_SIGNING_KEY_PEM`) — see `.github/workflows/ci.yml`.
-- **Repartitioning (Phase 7a) requires `idf.py erase-flash`.** This wipes the NVS record store and blocklist — reflash and re-seed from `dns_records.h`/`dns_blocklist_defaults.h`, or re-add records via the CRUD API, after upgrading from a pre-Phase-7a build.
+- **Repartitioning (Phase 7a) requires `idf.py erase-flash`.** This wipes the NVS record store, blocklist, and (as of Phase 7b) the stored Wi-Fi config — reflash and re-seed from `dns_records.h`/`dns_blocklist_defaults.h`/`wifi_credentials.h`, or re-provision over the SoftAP portal, after upgrading from a pre-Phase-7a build.
+- **The provisioning portal has no auth, by design.** `/scan`, `/provision`, and the setup page are reachable by anyone who joins `edge-dns-setup` — there's no credential yet to gate them behind at that point, and the AP itself being open is the actual access control. This is fine because provisioning mode never runs at the same time as normal operation (the mutating `/api/records` routes stay Basic-auth-gated as always) — see the SoftAP section above.
+- **STA connect failures fall back to the portal without erasing stored credentials.** A router that's merely rebooting recovers on its own next power cycle; only a factory reset (BOOT held ~5s) or a fresh `esp_wifi_set_config` via the portal actually changes what's stored.
