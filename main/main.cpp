@@ -5,6 +5,7 @@
 #include "mdns_responder.h"
 #include "ota_updater.h"
 #include "wifi_connect.h"
+#include "wifi_provision.h"
 
 namespace {
 constexpr const char *TAG = "main";
@@ -26,9 +27,13 @@ void log_psram_status()
 extern "C" void app_main(void)
 {
     log_psram_status();
-    wifi_connect();
-    dns_server_start();
-    http_server_start();
-    mdns_responder_start();
-    ota_updater_start();
+    if (wifi_connect_sta()) {
+        dns_server_start();
+        http_server_start();
+        mdns_responder_start();
+        ota_updater_start();
+        factory_reset_watch_start();
+    } else {
+        wifi_provision_start();
+    }
 }

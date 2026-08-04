@@ -31,6 +31,19 @@ void test_is_newer_major_beats_minor_and_patch();
 void test_is_newer_false_on_unparseable_remote();
 void test_is_newer_false_on_unparseable_current();
 
+// test_provision_validate.cpp's tests (Phase 7b) — same plain-function,
+// external-linkage pattern as the ota_version tests above.
+void test_ssid_empty_rejected();
+void test_ssid_length_1_ok();
+void test_ssid_length_32_ok();
+void test_ssid_length_33_too_long();
+void test_password_empty_is_open_network_ok();
+void test_password_length_7_too_short();
+void test_password_length_8_ok();
+void test_password_length_63_ok();
+void test_password_length_64_too_long();
+void test_ssid_multibyte_utf8_within_byte_limit_ok();
+
 namespace {
 
 // Encodes a dotted name ("test.loc") as length-prefixed labels terminated
@@ -414,6 +427,18 @@ extern "C" void app_main(void)
     RUN_TEST(test_is_newer_major_beats_minor_and_patch);
     RUN_TEST(test_is_newer_false_on_unparseable_remote);
     RUN_TEST(test_is_newer_false_on_unparseable_current);
+    // provision_validate tests (Phase 7b) — same plain-RUN_TEST pattern as
+    // the ota_version tests above, rather than TEST_CASE auto-registration.
+    RUN_TEST(test_ssid_empty_rejected);
+    RUN_TEST(test_ssid_length_1_ok);
+    RUN_TEST(test_ssid_length_32_ok);
+    RUN_TEST(test_ssid_length_33_too_long);
+    RUN_TEST(test_password_empty_is_open_network_ok);
+    RUN_TEST(test_password_length_7_too_short);
+    RUN_TEST(test_password_length_8_ok);
+    RUN_TEST(test_password_length_63_ok);
+    RUN_TEST(test_password_length_64_too_long);
+    RUN_TEST(test_ssid_multibyte_utf8_within_byte_limit_ok);
     // ESP-IDF's linux-target port starts the FreeRTOS scheduler before
     // calling app_main and never tears it down when app_main returns —
     // the process would otherwise hang forever after printing results.
