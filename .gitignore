@@ -13,3 +13,5 @@ cmake-build-debug-esp-idf/
 
 docs/superpowers/
 monitoring/.env
+
+sdkconfig.old
