@@ -488,6 +488,6 @@ void wifi_provision_start()
 
 void factory_reset_watch_start()
 {
-    xTaskCreate(factory_reset_task, "factory_reset_watch", 2048, nullptr, tskIDLE_PRIORITY + 1,
+    xTaskCreate(factory_reset_task, "factory_reset_watch", 4096, nullptr, tskIDLE_PRIORITY + 1,
                 nullptr);
 }

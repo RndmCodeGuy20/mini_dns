@@ -37,10 +37,11 @@ void event_handler(void *, esp_event_base_t event_base, int32_t event_id, void *
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        auto *disc = static_cast<wifi_event_sta_disconnected_t *>(event_data);
         if (s_got_ip_once) {
-            ESP_LOGW(TAG, "disconnected, retrying...");
+            ESP_LOGW(TAG, "disconnected (reason=%d), retrying...", disc->reason);
         } else {
-            ESP_LOGW(TAG, "initial connect attempt failed, retrying...");
+            ESP_LOGW(TAG, "initial connect attempt failed (reason=%d), retrying...", disc->reason);
         }
         vTaskDelay(pdMS_TO_TICKS(2000));
         esp_wifi_connect();
