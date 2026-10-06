@@ -5,13 +5,15 @@
 namespace {
 
 // Writes the 12-byte header common to every response this server sends:
-// ID echoed, QR=1/AA=1/RD-echoed/RCODE=rcode, QDCOUNT=1 (we always echo
-// exactly one question), NSCOUNT=0, ARCOUNT=0.
+// ID echoed, QR=1/RA=1/RD-echoed/RCODE=rcode, QDCOUNT=1 (we always echo
+// exactly one question), NSCOUNT=0, ARCOUNT=0. RA, not AA: to clients this
+// is a recursive resolver, and most answers are forwarded/cached rather
+// than authoritative — nslookup/host abandon a server that omits RA.
 void write_dns_response_header(uint8_t *buf, uint16_t query_id, uint16_t query_flags,
                                 uint16_t ancount, uint16_t rcode)
 {
     write_uint16_be(buf, 0, query_id);
-    write_uint16_be(buf, 2, (0x8400 | (query_flags & 0x0100)) | (rcode & 0x000F));
+    write_uint16_be(buf, 2, (0x8080 | (query_flags & 0x0100)) | (rcode & 0x000F));
     write_uint16_be(buf, 4, 1); // QDCOUNT
     write_uint16_be(buf, 6, ancount);
     write_uint16_be(buf, 8, 0); // NSCOUNT

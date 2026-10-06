@@ -294,6 +294,10 @@ TEST_CASE("build_a_record_response lays out header, question, and answer", "[dns
     uint16_t flags = read_uint16_be(tx, 2);
     TEST_ASSERT_EQUAL_UINT16(DNS_RCODE_NOERROR, flags & 0x000F);
     TEST_ASSERT_EQUAL_UINT16(0x0100, flags & 0x0100); // RD echoed
+    // We answer as a recursive resolver: RA set (nslookup/host reject a
+    // server without it), AA clear (forwarded/cached answers aren't ours).
+    TEST_ASSERT_EQUAL_UINT16(0x0080, flags & 0x0080);
+    TEST_ASSERT_EQUAL_UINT16(0x0000, flags & 0x0400);
     TEST_ASSERT_EQUAL_UINT16(1, read_uint16_be(tx, 4));  // qdcount
     TEST_ASSERT_EQUAL_UINT16(1, read_uint16_be(tx, 6));  // ancount
 
