@@ -581,6 +581,12 @@ CONFIG_PARTITION_TABLE_MD5=y
 # end of Partition Table
 
 #
+# mini_dns
+#
+CONFIG_MINI_DNS_QUERY_LOG_TARGET="192.168.0.100:54525"
+# end of mini_dns
+
+#
 # Compiler options
 #
 CONFIG_COMPILER_OPTIMIZATION_DEBUG=y

@@ -1,0 +1,12 @@
+menu "mini_dns"
+
+    config MINI_DNS_QUERY_LOG_TARGET
+        string "Query log target (ip:port)"
+        default ""
+        help
+            Where the DNS task sends one UDP line per query (Phase 8) — the
+            OTel Collector's udplog receiver (monitoring/otel-collector.yml),
+            which forwards to Grafana Cloud Loki. IPv4 "a.b.c.d:port" only.
+            Empty disables the query log.
+
+endmenu

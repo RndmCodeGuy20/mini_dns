@@ -6,4 +6,6 @@ services:
     volumes:
       - ./otel-collector.yml:/etc/otelcol/config.yml:ro
     env_file: .env
+    ports:
+      - "54525:54525/udp" # query log from the device (udp_log receiver)
     restart: unless-stopped

@@ -115,8 +115,128 @@
       "type": "stat",
       "gridPos": { "h": 4, "w": 6, "x": 18, "y": 28 },
       "targets": [{ "expr": "esp_coredump_present", "legendFormat": "coredump" }]
+    },
+    {
+      "id": 10,
+      "title": "Top domains",
+      "description": "Most-queried names over the dashboard time range, all outcomes (query log, Phase 8)",
+      "type": "bargauge",
+      "datasource": {
+        "type": "loki",
+        "uid": "grafanacloud-logs"
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 8,
+        "x": 0,
+        "y": 32
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "basic",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "grafanacloud-logs"
+          },
+          "expr": "topk(25, sum by (qname) (count_over_time({service_name=\"mini_dns\"} | logfmt [$__range])))",
+          "queryType": "instant",
+          "legendFormat": "{{qname}}"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Top forwarded domains",
+      "description": "Names that reached upstream, i.e. not blocked or locally answered \u2014 candidates for POST /api/blocklist",
+      "type": "bargauge",
+      "datasource": {
+        "type": "loki",
+        "uid": "grafanacloud-logs"
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 8,
+        "x": 8,
+        "y": 32
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "basic",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "grafanacloud-logs"
+          },
+          "expr": "topk(25, sum by (qname) (count_over_time({service_name=\"mini_dns\"} | logfmt | outcome=\"forwarded\" [$__range])))",
+          "queryType": "instant",
+          "legendFormat": "{{qname}}"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Top clients",
+      "description": "Query volume per LAN client IP",
+      "type": "bargauge",
+      "datasource": {
+        "type": "loki",
+        "uid": "grafanacloud-logs"
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 8,
+        "x": 16,
+        "y": 32
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "basic",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "grafanacloud-logs"
+          },
+          "expr": "topk(15, sum by (client) (count_over_time({service_name=\"mini_dns\"} | logfmt [$__range])))",
+          "queryType": "instant",
+          "legendFormat": "{{client}}"
+        }
+      ]
     }
   ],
   "schemaVersion": 39,
-  "version": 2
+  "version": 3
 }

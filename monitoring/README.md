@@ -23,6 +23,15 @@ the firmware changes.
 6. Dashboards > Import > upload `grafana/mini-dns.json`, then pick the
    `grafanacloud-*-prom` datasource.
 
+## Query log
+
+The collector also listens on UDP `54525` (`udp_log` receiver) for one
+logfmt line per DNS query from the device, forwarded to Grafana Cloud Loki
+(`grafanacloud-logs` datasource, `{service_name="mini_dns"} | logfmt`). The
+device sends to `CONFIG_MINI_DNS_QUERY_LOG_TARGET` (set via
+`idf.py menuconfig` → mini_dns), which must be this machine's LAN IP and
+port `54525`. Lines include the querying client's IP.
+
 ## Notes
 
 - If the device's IP changes (DHCP lease renewal), update `MINI_DNS_TARGET`

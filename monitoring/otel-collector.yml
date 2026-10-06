@@ -8,6 +8,12 @@ receivers:
           static_configs:
             - targets:
                 - "${env:MINI_DNS_TARGET}"
+  # One logfmt line per DNS query from the device (Phase 8 query log,
+  # CONFIG_MINI_DNS_QUERY_LOG_TARGET in the firmware).
+  udp_log:
+    listen_address: 0.0.0.0:54525
+    resource:
+      service.name: mini_dns
 
 processors:
   batch: {}
@@ -22,5 +28,9 @@ service:
   pipelines:
     metrics:
       receivers: [prometheus]
+      processors: [batch]
+      exporters: [otlp_http/grafana_cloud]
+    logs:
+      receivers: [udp_log]
       processors: [batch]
       exporters: [otlp_http/grafana_cloud]

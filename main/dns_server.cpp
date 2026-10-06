@@ -35,6 +35,68 @@ constexpr size_t TX_BUFFER_SIZE = 512;
 // 5000ms here would have fed the watchdog right at its own deadline.
 constexpr int64_t SELECT_MAX_TIMEOUT_MS = 2000;
 
+// Query log (Phase 8): one fire-and-forget UDP line per query to
+// CONFIG_MINI_DNS_QUERY_LOG_TARGET. Opened once by query_log_start() before
+// the main loop and only touched by the DNS task afterward, so no lock.
+// -1 means disabled (empty/invalid target, or socket() failed).
+int s_query_log_sock = -1;
+sockaddr_in s_query_log_addr = {};
+
+void query_log_start()
+{
+    std::string target = CONFIG_MINI_DNS_QUERY_LOG_TARGET;
+    if (target.empty()) {
+        ESP_LOGI(TAG, "query log disabled (CONFIG_MINI_DNS_QUERY_LOG_TARGET empty)");
+        return;
+    }
+    size_t colon = target.rfind(':');
+    int port = colon == std::string::npos ? 0 : atoi(target.c_str() + colon + 1);
+    s_query_log_addr.sin_family = AF_INET;
+    s_query_log_addr.sin_port = htons(static_cast<uint16_t>(port));
+    if (port <= 0 || port > 65535 ||
+        inet_pton(AF_INET, target.substr(0, colon).c_str(), &s_query_log_addr.sin_addr) != 1) {
+        ESP_LOGE(TAG, "invalid CONFIG_MINI_DNS_QUERY_LOG_TARGET '%s', query log disabled",
+                 target.c_str());
+        return;
+    }
+    s_query_log_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (s_query_log_sock < 0) {
+        ESP_LOGE(TAG, "query log socket() failed: errno %d", errno);
+        return;
+    }
+    ESP_LOGI(TAG, "query log -> %s", target.c_str());
+}
+
+// Sends `qname=... qtype=... outcome=... client=...` (logfmt, parsed in
+// Loki with `| logfmt`). qname is attacker-controlled raw label bytes, so
+// anything outside hostname characters becomes '?' — otherwise a crafted
+// query could inject spaces/newlines and forge extra fields. A failed send
+// is dropped silently: losing a line is fine, stalling the DNS task isn't.
+void log_query(const std::string &qname_lower, uint16_t qtype, const char *outcome,
+               const char *client)
+{
+    if (s_query_log_sock < 0) {
+        return;
+    }
+    std::string safe = qname_lower.empty() ? "." : qname_lower;
+    for (char &c : safe) {
+        bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-' ||
+                  c == '_';
+        if (!ok) {
+            c = '?';
+        }
+    }
+    char line[320];
+    int n = snprintf(line, sizeof(line), "qname=%s qtype=%s outcome=%s client=%s", safe.c_str(),
+                     qtype_to_string(qtype), outcome, client);
+    if (n <= 0) {
+        return;
+    }
+    size_t line_len = std::min(static_cast<size_t>(n), sizeof(line) - 1);
+    sendto(s_query_log_sock, line, line_len, MSG_DONTWAIT,
+           reinterpret_cast<const sockaddr *>(&s_query_log_addr), sizeof(s_query_log_addr));
+}
+
 int64_t now_ms()
 {
     return esp_timer_get_time() / 1000;
@@ -154,6 +216,7 @@ void handle_client_query(int listen_sock, DnsForwarder &forwarder, DnsCache &cac
              qtype_to_string(qtype), static_cast<unsigned>(qtype),
              static_cast<unsigned>(header->id));
     metrics().inc_queries();
+    std::string qname_lower = lowercase_ascii(*qname);
 
     // A copy, not a pointer: record_store().find() releases its internal
     // lock before returning, by design — see dns_record_store.h. The whole
@@ -165,6 +228,7 @@ void handle_client_query(int listen_sock, DnsForwarder &forwarder, DnsCache &cac
 
     if (record.has_value()) {
         metrics().inc_local_hits();
+        log_query(qname_lower, qtype, "local", addr_str);
         // Local table is authoritative for this name regardless of
         // qtype — never shadowed by cache/upstream (see ARCHITECTURE.md).
         // A name may hold an A, an AAAA, or both (Phase 6 dual-stack);
@@ -190,10 +254,9 @@ void handle_client_query(int listen_sock, DnsForwarder &forwarder, DnsCache &cac
         return;
     }
 
-    std::string qname_lower = lowercase_ascii(*qname);
-
     if (blocklist().is_blocked(qname_lower)) {
         blocklist().record_block();
+        log_query(qname_lower, qtype, "blocked", addr_str);
         std::optional<size_t> resp_len;
         if (qtype == DNS_TYPE_A) {
             constexpr std::array<uint8_t, 4> SINKHOLE_IP = {0, 0, 0, 0};
@@ -220,6 +283,7 @@ void handle_client_query(int listen_sock, DnsForwarder &forwarder, DnsCache &cac
     const dns_cache_entry_t *cached = cache.lookup(qname_lower, qtype, now_ms());
     if (cached != nullptr) {
         metrics().inc_cache_hits();
+        log_query(qname_lower, qtype, "cache", addr_str);
         auto resp_len = build_relayed_response(header->id, header->flags, question_section,
                                                 question_section_len, cached->rcode,
                                                 cached->ancount, cached->answer_section.data(),
@@ -239,8 +303,10 @@ void handle_client_query(int listen_sock, DnsForwarder &forwarder, DnsCache &cac
                                         socklen, now_ms());
     if (forwarded) {
         metrics().inc_forwarded();
+        log_query(qname_lower, qtype, "forwarded", addr_str);
     } else {
         metrics().inc_servfail();
+        log_query(qname_lower, qtype, "servfail", addr_str);
         send_servfail(listen_sock,
                       {header->id, header->flags,
                        std::vector<uint8_t>(question_section,
@@ -275,6 +341,7 @@ void dns_server_task(void *)
         return;
     }
     ESP_LOGI(TAG, "listening on UDP port %d", DNS_PORT);
+    query_log_start();
 
     // A forwarder that fails to start runs in a permanently-degraded
     // mode (local table only, everything else NXDOMAIN) rather than
