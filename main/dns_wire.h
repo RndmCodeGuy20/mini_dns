@@ -75,6 +75,15 @@ std::optional<answer_section_scan_t> scan_answer_section(const uint8_t *buf, siz
                                                           size_t answer_start_offset,
                                                           uint16_t ancount);
 
+// Rewrites every RR's TTL in a captured answer section (as stored by
+// DnsCache, starting at its first RR) to ttl - elapsed_seconds, floored at
+// 0. Used on cache hits so a client isn't told the full original TTL for an
+// answer that's already been cached a while — otherwise it would keep the
+// record for up to twice as long as upstream allowed. Compression pointers
+// in owner names are skipped, never followed. Returns false (section left
+// partially rewritten) if the section doesn't parse as `ancount` RRs.
+bool age_answer_ttls(uint8_t *section, size_t len, uint16_t ancount, uint32_t elapsed_seconds);
+
 const char *qtype_to_string(uint16_t qtype);
 
 // Builds a DNS response echoing the request's question section verbatim,

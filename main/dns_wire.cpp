@@ -175,6 +175,25 @@ std::optional<answer_section_scan_t> scan_answer_section(const uint8_t *buf, siz
     return answer_section_scan_t{offset, min_ttl};
 }
 
+bool age_answer_ttls(uint8_t *section, size_t len, uint16_t ancount, uint32_t elapsed_seconds)
+{
+    size_t offset = 0;
+    for (uint16_t i = 0; i < ancount; ++i) {
+        if (!skip_name(section, len, offset) || offset + DNS_ANSWER_RR_FIXED_SIZE > len) {
+            return false;
+        }
+        uint32_t ttl = read_uint32_be(section, offset + 4);
+        write_uint32_be(section, offset + 4, ttl > elapsed_seconds ? ttl - elapsed_seconds : 0);
+        uint16_t rdlength = read_uint16_be(section, offset + 8);
+        offset += DNS_ANSWER_RR_FIXED_SIZE;
+        if (offset + rdlength > len) {
+            return false;
+        }
+        offset += rdlength;
+    }
+    return true;
+}
+
 const char *qtype_to_string(uint16_t qtype)
 {
     switch (qtype) {

@@ -269,6 +269,48 @@ TEST_CASE("scan_answer_section rejects an rdlength that overruns the buffer", "[
     TEST_ASSERT_FALSE(scan.has_value());
 }
 
+// --- age_answer_ttls ---------------------------------------------------------
+
+// A cached answer section on its own (offset 0 = first RR), exactly as
+// DnsCache stores it — compression pointers point outside it and must not
+// be followed.
+TEST_CASE("age_answer_ttls subtracts elapsed seconds from every RR", "[dns_wire]")
+{
+    std::vector<uint8_t> section;
+    size_t offset = append_test_rr(section, 0, /*ttl=*/300, {1, 2, 3, 4});
+    append_test_rr(section, offset, /*ttl=*/60, {5, 6, 7, 8});
+
+    TEST_ASSERT_TRUE(age_answer_ttls(section.data(), section.size(), /*ancount=*/2,
+                                     /*elapsed_seconds=*/50));
+    TEST_ASSERT_EQUAL_UINT32(250, read_uint32_be(section.data(), 2 + 4));
+    TEST_ASSERT_EQUAL_UINT32(10, read_uint32_be(section.data(), offset + 2 + 4));
+    // rdata untouched
+    TEST_ASSERT_EQUAL_UINT8(4, section[2 + DNS_ANSWER_RR_FIXED_SIZE + 3]);
+}
+
+TEST_CASE("age_answer_ttls floors at zero instead of wrapping", "[dns_wire]")
+{
+    std::vector<uint8_t> section;
+    append_test_rr(section, 0, /*ttl=*/30, {1, 2, 3, 4});
+
+    TEST_ASSERT_TRUE(age_answer_ttls(section.data(), section.size(), 1, /*elapsed_seconds=*/45));
+    TEST_ASSERT_EQUAL_UINT32(0, read_uint32_be(section.data(), 2 + 4));
+}
+
+TEST_CASE("age_answer_ttls handles ancount == 0", "[dns_wire]")
+{
+    TEST_ASSERT_TRUE(age_answer_ttls(nullptr, 0, 0, 100));
+}
+
+TEST_CASE("age_answer_ttls rejects a truncated record", "[dns_wire]")
+{
+    std::vector<uint8_t> section;
+    append_test_rr(section, 0, /*ttl=*/60, {1, 2, 3, 4});
+    section.resize(section.size() - 1); // rdata cut short
+
+    TEST_ASSERT_FALSE(age_answer_ttls(section.data(), section.size(), 1, 10));
+}
+
 // --- qtype_to_string ---------------------------------------------------------
 
 TEST_CASE("qtype_to_string recognizes A, AAAA, and everything else", "[dns_wire]")

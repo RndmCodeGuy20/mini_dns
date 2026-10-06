@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "dns_blocklist.h"
 #include "dns_cache.h"
@@ -284,11 +285,21 @@ void handle_client_query(int listen_sock, DnsForwarder &forwarder, DnsCache &cac
     if (cached != nullptr) {
         metrics().inc_cache_hits();
         log_query(qname_lower, qtype, "cache", addr_str);
+        // Age a copy, never the cached bytes: the entry is served again
+        // later and must keep the TTLs it was captured with.
+        std::vector<uint8_t> answer = cached->answer_section;
+        uint32_t age_s = static_cast<uint32_t>((now_ms() - cached->inserted_at_ms) / 1000);
+        if (!age_answer_ttls(answer.data(), answer.size(), cached->ancount, age_s)) {
+            // Can't happen for a section scan_answer_section accepted at
+            // insert time; serve it un-aged rather than drop the answer.
+            ESP_LOGW(TAG, "couldn't age cached TTLs for '%s', serving original",
+                     qname->c_str());
+            answer = cached->answer_section;
+        }
         auto resp_len = build_relayed_response(header->id, header->flags, question_section,
                                                 question_section_len, cached->rcode,
-                                                cached->ancount, cached->answer_section.data(),
-                                                cached->answer_section.size(), tx_buffer,
-                                                sizeof(tx_buffer));
+                                                cached->ancount, answer.data(), answer.size(),
+                                                tx_buffer, sizeof(tx_buffer));
         if (resp_len) {
             ESP_LOGI(TAG, "cache hit for '%s'", qname->c_str());
             send_response(listen_sock, tx_buffer, *resp_len, source_addr, socklen,
