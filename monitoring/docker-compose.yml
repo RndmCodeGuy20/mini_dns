@@ -1,26 +1,9 @@
 services:
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: mini_dns_prometheus
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.162.0
+    container_name: mini_dns_otel_collector
+    command: ["--config=/etc/otelcol/config.yml"]
     volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus-data:/prometheus
-    ports:
-      - "9090:9090"
+      - ./otel-collector.yml:/etc/otelcol/config.yml:ro
+    env_file: .env
     restart: unless-stopped
-
-  grafana:
-    image: grafana/grafana:latest
-    container_name: mini_dns_grafana
-    depends_on:
-      - prometheus
-    volumes:
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - grafana-data:/var/lib/grafana
-    ports:
-      - "3000:3000"
-    restart: unless-stopped
-
-volumes:
-  grafana-data:
-  prometheus-data:

@@ -1,28 +1,34 @@
-# mini_dns monitoring stack
+# mini_dns monitoring
 
-Prometheus + Grafana for the device's `/metrics` endpoint. Runs on your dev
-machine, not the ESP32 — the ESP32 is just a scrape target.
+An OpenTelemetry Collector on your dev machine scrapes the device's `/metrics`
+endpoint and pushes it over OTLP to Grafana Cloud (same stack as
+health_sync_api). The ESP32 is still just a scrape target, so nothing about
+the firmware changes.
 
 ## Setup
 
 1. Find the device's LAN IP from its boot log (or `edge-dns.local` if your
    local resolver forwards mDNS, which most don't by default).
-2. Edit `prometheus/prometheus.yml`, replace `<esp32-ip>` with that IP.
-3. From this directory:
-   ```
-   docker compose up -d
-   ```
-4. Prometheus: http://localhost:9090 — check Status > Targets, `mini_dns`
-   job should be `UP`.
-5. Grafana: http://localhost:3000 — login `admin`/`admin`, you'll be
-   prompted to change it on first login. Dashboard "mini_dns" is
-   auto-provisioned under the `mini_dns` folder.
+2. From this directory, `cp .env.example .env` and fill in:
+   - `OTEL_EXPORTER_OTLP_ENDPOINT`: Grafana Cloud OTLP gateway URL.
+   - `GRAFANA_OTLP_AUTH`: `Basic <base64 instanceId:token>`. This is the
+     value part of health_sync_api's `OTEL_EXPORTER_OTLP_HEADERS`, without
+     the `Authorization=` prefix.
+   - `MINI_DNS_TARGET`: `<esp32-ip>:80`.
+3. `docker compose up -d`
+4. `docker compose logs -f otel-collector`: there should be no scrape or
+   export errors.
+5. In Grafana Cloud Explore, pick the `grafanacloud-*-prom` datasource and
+   query `{job="mini_dns"}`.
+6. Dashboards > Import > upload `grafana/mini-dns.json`, then pick the
+   `grafanacloud-*-prom` datasource.
 
 ## Notes
 
-- If the device's IP changes (DHCP lease renewal), re-edit
-  `prometheus/prometheus.yml` and `docker compose restart prometheus`.
-  A static DHCP reservation on your router avoids this.
-- Grafana's datasource and dashboard are provisioned from files
-  (`grafana/provisioning/`) — don't hand-edit them in the UI, changes
-  won't persist across container recreation.
+- If the device's IP changes (DHCP lease renewal), update `MINI_DNS_TARGET`
+  in `.env` and run `docker compose up -d`. A static DHCP reservation on
+  your router avoids this.
+- `.env` holds the Grafana Cloud token and is gitignored.
+- The dashboard in Cloud isn't provisioned from this file. After editing
+  `grafana/mini-dns.json`, re-import it, or export from the UI back into
+  the file.
