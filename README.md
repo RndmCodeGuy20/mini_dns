@@ -89,6 +89,12 @@ curl -u admin:<your-password> -X PUT -d '{"host":"foo.loc","ip":"192.168.1.100"}
 curl -u admin:<your-password> -X DELETE -d '{"host":"foo.loc"}' \
   http://<esp32-ip>/api/records
 
+# Blocklist — POST/DELETE require Basic auth; POST takes a batch
+curl -u admin:<your-password> -X POST -d '{"domains":["ads.example.com","tracker.example.net"]}' \
+  http://<esp32-ip>/api/blocklist
+curl -u admin:<your-password> -X DELETE -d '{"domain":"ads.example.com"}' \
+  http://<esp32-ip>/api/blocklist
+
 # Dual-stack records — "ip" and "ipv6" are each optional, but a
 # create/update needs at least one; either or both together are fine
 curl -u admin:<your-password> -X POST \

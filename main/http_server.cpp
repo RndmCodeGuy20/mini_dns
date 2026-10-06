@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "admin_credentials.h"
 #include "cJSON.h"
@@ -189,8 +190,9 @@ void add_cors_headers(httpd_req_t *req, char *origin_buf, size_t origin_buf_size
     httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Authorization,Content-Type");
 }
 
-// HTTP Basic auth, checked only on the mutating /api/records routes — every
-// GET (dashboard, /api/records, /api/blocklist, /metrics) stays open so
+// HTTP Basic auth, checked only on the mutating routes (/api/records,
+// /api/blocklist, /api/ota/check) — every GET (dashboard, /api/records,
+// /api/blocklist, /metrics) stays open so
 // Prometheus can keep scraping unauthenticated (see Phase 3). Credentials
 // live in admin_credentials.h, gitignored like wifi_credentials.h. Sends 401
 // + WWW-Authenticate itself on failure; caller just returns on `false`.
@@ -231,13 +233,17 @@ bool check_auth(httpd_req_t *req)
     return true;
 }
 
-// Reads the request body into a cJSON object. Rejects bodies over 1KB (a
-// record entry is a handful of bytes; this is generous headroom, not a
-// real capacity need) and returns nullptr on any read/parse failure —
-// callers respond 400.
-cJSON *read_json_body(httpd_req_t *req)
+// Reads the request body into a cJSON object. Rejects bodies over max_len
+// and returns nullptr on any read/parse failure — callers respond 400.
+constexpr size_t RECORD_BODY_MAX_LEN = 1024; // a record is a handful of bytes; generous headroom
+// Batch imports (Phase 8): ~8KB is a few hundred domains per request. The
+// body is buffered whole on the heap, so keep it modest — callers can send
+// several batches.
+constexpr size_t BLOCKLIST_BODY_MAX_LEN = 8192;
+
+cJSON *read_json_body(httpd_req_t *req, size_t max_len)
 {
-    if (req->content_len == 0 || req->content_len > 1024) {
+    if (req->content_len == 0 || req->content_len > max_len) {
         return nullptr;
     }
     std::string body(req->content_len, '\0');
@@ -383,7 +389,7 @@ esp_err_t records_post_handler(httpd_req_t *req)
     if (!check_auth(req)) {
         return ESP_OK;
     }
-    cJSON *body = read_json_body(req);
+    cJSON *body = read_json_body(req, RECORD_BODY_MAX_LEN);
     if (body == nullptr) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON body");
     }
@@ -425,7 +431,7 @@ esp_err_t records_put_handler(httpd_req_t *req)
     if (!check_auth(req)) {
         return ESP_OK;
     }
-    cJSON *body = read_json_body(req);
+    cJSON *body = read_json_body(req, RECORD_BODY_MAX_LEN);
     if (body == nullptr) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON body");
     }
@@ -463,7 +469,7 @@ esp_err_t records_delete_handler(httpd_req_t *req)
     if (!check_auth(req)) {
         return ESP_OK;
     }
-    cJSON *body = read_json_body(req);
+    cJSON *body = read_json_body(req, RECORD_BODY_MAX_LEN);
     if (body == nullptr) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON body");
     }
@@ -501,7 +507,8 @@ esp_err_t blocklist_get_handler(httpd_req_t *req)
     }
 
     const DnsBlocklist &bl = blocklist();
-    cJSON_AddNumberToObject(root, "count", static_cast<double>(bl.size()));
+    std::vector<std::string> snapshot = bl.snapshot();
+    cJSON_AddNumberToObject(root, "count", static_cast<double>(snapshot.size()));
     cJSON_AddNumberToObject(root, "blocked_total", static_cast<double>(bl.blocks_total()));
 
     cJSON *domains = cJSON_CreateArray();
@@ -510,7 +517,7 @@ esp_err_t blocklist_get_handler(httpd_req_t *req)
         cJSON_Delete(root);
         return httpd_resp_send_500(req);
     }
-    for (const auto &domain : bl.domains()) {
+    for (const auto &domain : snapshot) {
         cJSON_AddItemToArray(domains, cJSON_CreateString(domain.c_str()));
     }
     cJSON_AddItemToObject(root, "domains", domains);
@@ -534,6 +541,92 @@ constexpr httpd_uri_t BLOCKLIST_URI = {
     .uri = "/api/blocklist",
     .method = HTTP_GET,
     .handler = blocklist_get_handler,
+    .user_ctx = nullptr,
+};
+
+esp_err_t send_blocklist_result(httpd_req_t *req, DnsBlocklistResult result)
+{
+    switch (result) {
+    case DnsBlocklistResult::kOk:
+        return httpd_resp_send(req, nullptr, 0);
+    case DnsBlocklistResult::kNotFound:
+        return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "domain not found");
+    case DnsBlocklistResult::kFull:
+        httpd_resp_set_status(req, "507 Insufficient Storage");
+        return httpd_resp_send(req, "blocklist full", HTTPD_RESP_USE_STRLEN);
+    case DnsBlocklistResult::kPersistFailed:
+    default:
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "failed to persist blocklist");
+    }
+}
+
+// POST {"domains": ["ads.example.com", ...]} — adds a batch in one NVS
+// write (Phase 8). Every entry is validated before any is applied, so a
+// bad entry rejects the whole batch rather than half-applying it.
+esp_err_t blocklist_post_handler(httpd_req_t *req)
+{
+    if (!check_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json_body(req, BLOCKLIST_BODY_MAX_LEN);
+    if (body == nullptr) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON body");
+    }
+    cJSON *items = cJSON_GetObjectItemCaseSensitive(body, "domains");
+    if (!cJSON_IsArray(items) || cJSON_GetArraySize(items) == 0) {
+        cJSON_Delete(body);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "\"domains\" must be a non-empty array");
+    }
+    std::vector<std::string> domains;
+    const cJSON *item = nullptr;
+    cJSON_ArrayForEach(item, items)
+    {
+        if (!cJSON_IsString(item) || !valid_hostname(item->valuestring)) {
+            cJSON_Delete(body);
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid domain in \"domains\"");
+        }
+        domains.push_back(lowercase_ascii(item->valuestring));
+    }
+    cJSON_Delete(body);
+
+    return send_blocklist_result(req, blocklist().add(domains));
+}
+
+constexpr httpd_uri_t BLOCKLIST_POST_URI = {
+    .uri = "/api/blocklist",
+    .method = HTTP_POST,
+    .handler = blocklist_post_handler,
+    .user_ctx = nullptr,
+};
+
+// DELETE {"domain": "ads.example.com"} — exact entry only; removing
+// "example.com" does not touch a separately listed "ads.example.com".
+esp_err_t blocklist_delete_handler(httpd_req_t *req)
+{
+    if (!check_auth(req)) {
+        return ESP_OK;
+    }
+    cJSON *body = read_json_body(req, RECORD_BODY_MAX_LEN);
+    if (body == nullptr) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON body");
+    }
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(body, "domain");
+    if (!cJSON_IsString(item) || !valid_hostname(item->valuestring)) {
+        cJSON_Delete(body);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid or missing \"domain\"");
+    }
+    std::string domain = lowercase_ascii(item->valuestring);
+    cJSON_Delete(body);
+
+    return send_blocklist_result(req, blocklist().remove(domain));
+}
+
+constexpr httpd_uri_t BLOCKLIST_DELETE_URI = {
+    .uri = "/api/blocklist",
+    .method = HTTP_DELETE,
+    .handler = blocklist_delete_handler,
     .user_ctx = nullptr,
 };
 
@@ -779,7 +872,7 @@ void http_server_start()
     // bump with real headroom rather than the exact new count — the same
     // "leave headroom, don't just +1" lesson as the Phase 1 socket-budget
     // trap (see ARCHITECTURE.md).
-    config.max_uri_handlers = 14; // was 12; +2 for /api/ota, /api/ota/check
+    config.max_uri_handlers = 16; // +2 for POST/DELETE /api/blocklist (Phase 8): 12 used
 
     ESP_ERROR_CHECK(httpd_start(&server, &config));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ROOT_URI));
@@ -789,6 +882,8 @@ void http_server_start()
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &RECORDS_DELETE_URI));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &RECORDS_OPTIONS_URI));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &BLOCKLIST_URI));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &BLOCKLIST_POST_URI));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &BLOCKLIST_DELETE_URI));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &METRICS_URI));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &OTA_GET_URI));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &OTA_CHECK_POST_URI));
